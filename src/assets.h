@@ -17,6 +17,11 @@ struct MaterialData {
     int image = -1;
     int detailImage = -1;  // AC multimap: diffuse alpha blends toward this texture
     float detailUv = 1.0f;
+    int normalImage = -1;  // tangent-space normal map (Direct3D green channel)
+    int mapsImage = -1;    // AC multimap: R specular, G gloss, B reflection mask
+    // Assetto Corsa shading values.
+    float ksDiffuse = 0.4f, ksAmbient = 0.4f, ksSpecular = 0.0f, ksSpecularExp = 20.0f;
+    float fresnelC = 0.0f, fresnelExp = 5.0f, fresnelMax = 0.0f;
     float baseColor[4] = {1, 1, 1, 1};
     float emissive[3] = {0, 0, 0};
     float cutoff = 0.5f;
@@ -38,7 +43,7 @@ struct MeshGroup {
 };
 
 struct ModelData {
-    std::vector<float> pos, nrm, uv;  // 3, 3, 2 floats per vertex
+    std::vector<float> pos, nrm, uv, tan;  // 3, 3, 2, 4 floats per vertex
     std::vector<uint32_t> idx;
     std::vector<MaterialData> materials;
     std::vector<ImageData> images;

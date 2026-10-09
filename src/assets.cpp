@@ -234,12 +234,24 @@ bool loadGlb(const std::string& path, ModelData& out, std::vector<CollisionData>
             md.image = textureImage(data, m.pbr_metallic_roughness.base_color_texture.texture);
         }
         std::memcpy(md.emissive, m.emissive_factor, sizeof(md.emissive));
+        md.normalImage = textureImage(data, m.normal_texture.texture);
         if (m.extras.data) {
             json ex = json::parse(m.extras.data, nullptr, false);
-            if (ex.is_object() && ex.contains("detail_texture")) {
-                int t = ex["detail_texture"].get<int>();
-                if (t >= 0 && t < int(data->textures_count)) md.detailImage = textureImage(data, &data->textures[t]);
+            if (ex.is_object()) {
+                auto image = [&](const char* key) {
+                    int t = ex.value(key, -1);
+                    return (t >= 0 && t < int(data->textures_count)) ? textureImage(data, &data->textures[t]) : -1;
+                };
+                md.detailImage = image("detail_texture");
                 md.detailUv = ex.value("detail_uv", 1.0f);
+                md.mapsImage = image("maps_texture");
+                md.ksDiffuse = ex.value("ksDiffuse", 0.4f);
+                md.ksAmbient = ex.value("ksAmbient", 0.4f);
+                md.ksSpecular = ex.value("ksSpecular", 0.0f);
+                md.ksSpecularExp = ex.value("ksSpecularEXP", 20.0f);
+                md.fresnelC = ex.value("fresnelC", 0.0f);
+                md.fresnelExp = ex.value("fresnelEXP", 5.0f);
+                md.fresnelMax = ex.value("fresnelMaxLevel", 0.0f);
             }
         }
         md.alpha = m.alpha_mode == cgltf_alpha_mode_blend  ? MaterialData::Blend
@@ -278,18 +290,20 @@ bool loadGlb(const std::string& path, ModelData& out, std::vector<CollisionData>
         cgltf_node_transform_local(&node, g.matrix.m);
         for (cgltf_size p = 0; p < node.mesh->primitives_count; ++p) {
             const cgltf_primitive& prim = node.mesh->primitives[p];
-            const cgltf_accessor *pa = nullptr, *na = nullptr, *ta = nullptr;
+            const cgltf_accessor *pa = nullptr, *na = nullptr, *ta = nullptr, *tga = nullptr;
             for (cgltf_size a = 0; a < prim.attributes_count; ++a) {
                 const cgltf_attribute& at = prim.attributes[a];
                 if (at.type == cgltf_attribute_type_position) pa = at.data;
                 else if (at.type == cgltf_attribute_type_normal) na = at.data;
                 else if (at.type == cgltf_attribute_type_texcoord && at.index == 0) ta = at.data;
+                else if (at.type == cgltf_attribute_type_tangent) tga = at.data;
             }
             if (!pa || !prim.indices) continue;
             uint32_t base = uint32_t(out.pos.size() / 3);
             readFloats(pa, 3, out.pos);
             if (na) readFloats(na, 3, out.nrm); else out.nrm.resize(out.pos.size(), 0.0f);
             if (ta) readFloats(ta, 2, out.uv); else out.uv.resize(out.pos.size() / 3 * 2, 0.0f);
+            if (tga) readFloats(tga, 4, out.tan); else out.tan.resize(out.pos.size() / 3 * 4, 0.0f);
             Primitive pr;
             pr.firstIndex = uint32_t(out.idx.size());
             pr.indexCount = uint32_t(prim.indices->count);

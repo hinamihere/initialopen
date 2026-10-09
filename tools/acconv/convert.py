@@ -135,16 +135,19 @@ def walk_world(node, parent=IDENT, active=True):
 
 
 def bake(mesh, M):
-    """Transform a kn5 mesh by M. Returns (positions, normals, uvs, indices16)."""
+    """Transform a kn5 mesh by M. Returns (positions, normals, uvs, tangents, indices16)."""
     a = array("f")
     a.frombytes(mesh.vertices)
     n = mesh.vertex_count
     px, py, pz = a[0::11], a[1::11], a[2::11]
     nx, ny, nz = a[3::11], a[4::11], a[5::11]
+    qx, qy, qz = a[8::11], a[9::11], a[10::11]
     pos, nrm, uv = array("f", bytes(12 * n)), array("f", bytes(12 * n)), array("f", bytes(8 * n))
+    tan = array("f", bytes(12 * n))
     if M == IDENT:
         pos[0::3], pos[1::3], pos[2::3] = px, py, pz
         nrm[0::3], nrm[1::3], nrm[2::3] = nx, ny, nz
+        tan[0::3], tan[1::3], tan[2::3] = qx, qy, qz
     else:
         m = M
         pos[0::3] = array("f", [x * m[0] + y * m[4] + z * m[8] + m[12] for x, y, z in zip(px, py, pz)])
@@ -157,24 +160,28 @@ def bake(mesh, M):
         nrm[0::3] = array("f", [x * s for x, s in zip(tx, inv)])
         nrm[1::3] = array("f", [y * s for y, s in zip(ty, inv)])
         nrm[2::3] = array("f", [z * s for z, s in zip(tz, inv)])
+        tan[0::3] = array("f", [x * m[0] + y * m[4] + z * m[8] for x, y, z in zip(qx, qy, qz)])
+        tan[1::3] = array("f", [x * m[1] + y * m[5] + z * m[9] for x, y, z in zip(qx, qy, qz)])
+        tan[2::3] = array("f", [x * m[2] + y * m[6] + z * m[10] for x, y, z in zip(qx, qy, qz)])
     uv[0::2], uv[1::2] = a[6::11], a[7::11]
     idx = array("H")
     idx.frombytes(mesh.indices)
-    return pos, nrm, uv, idx
+    return pos, nrm, uv, tan, idx
 
 
 class Batch:
     """Geometry merged for one material."""
 
     def __init__(self):
-        self.pos, self.nrm, self.uv, self.idx = array("f"), array("f"), array("f"), array("I")
+        self.pos, self.nrm, self.uv, self.tan, self.idx = array("f"), array("f"), array("f"), array("f"), array("I")
 
-    def add(self, pos, nrm, uv, idx):
+    def add(self, pos, nrm, uv, idx, tan=None):
         base = len(self.pos) // 3
         self.pos += pos
         if nrm is not None:
             self.nrm += nrm
             self.uv += uv
+            self.tan += tan
         self.idx += array("I", [i + base for i in idx])
 
     @property
@@ -257,6 +264,12 @@ class MaterialExporter:
                 "ac_shader": m.shader,
                 "ksDiffuse": props.get("ksDiffuse", (0.4,))[0],
                 "ksAmbient": props.get("ksAmbient", (0.4,))[0],
+                "ksSpecular": props.get("ksSpecular", (0.0,))[0],
+                "ksSpecularEXP": props.get("ksSpecularEXP", (20.0,))[0],
+                "fresnelC": props.get("fresnelC", (0.0,))[0],
+                "fresnelEXP": props.get("fresnelEXP", (5.0,))[0],
+                "fresnelMaxLevel": props.get("fresnelMaxLevel", (0.0,))[0],
+                "isAdditive": props.get("isAdditive", (0.0,))[0],
                 "ksEmissive": ks_emissive,
             },
         }
@@ -269,6 +282,17 @@ class MaterialExporter:
             if dt is not None:
                 mat["extras"]["detail_texture"] = dt
                 mat["extras"]["detail_uv"] = props.get("detailUVMultiplier", (1.0,))[0]
+        # Normal map (tangent space, Direct3D green channel) and the multimap "maps"
+        # texture: R = specular, G = gloss, B = reflection mask.
+        nm = m.samplers.get("txNormal")
+        if nm and not nm.lower().startswith("flat"):
+            t = self.texture(model, model_id, nm)
+            if t is not None:
+                mat["normalTexture"] = {"index": t}
+        if m.shader.startswith("ksPerPixelMultiMap") and "txMaps" in m.samplers:
+            t = self.texture(model, model_id, m.samplers["txMaps"])
+            if t is not None:
+                mat["extras"]["maps_texture"] = t
         tex_name = m.samplers.get("txDiffuse")
         if tex_name:
             t = self.texture(model, model_id, tex_name)
@@ -285,10 +309,15 @@ def emit_batches(glb: Glb, name: str, batches: dict, matx: MaterialExporter, ext
     for (model, model_id, mat_index, emissive), b in batches.items():
         if not b.idx:
             continue
+        n = len(b.tan) // 3
+        tan4 = array("f", bytes(16 * n))
+        tan4[0::4], tan4[1::4], tan4[2::4] = b.tan[0::3], b.tan[1::3], b.tan[2::3]
+        tan4[3::4] = array("f", [1.0]) * n
         prims.append({
             "attributes": {
                 "POSITION": glb.vec_accessor(b.pos, 3, with_bounds=True),
                 "NORMAL": glb.vec_accessor(b.nrm, 3),
+                "TANGENT": glb.vec_accessor(tan4, 4),
                 "TEXCOORD_0": glb.vec_accessor(b.uv, 2),
             },
             "indices": glb.index_accessor(b.idx),
@@ -427,13 +456,13 @@ def convert_track(track_dir: str, layout: str, out_dir: str):
             if not visible and not surface:
                 stats["hidden"] += 1
                 continue
-            pos, nrm, uv, idx = bake(mesh, W)
+            pos, nrm, uv, tan, idx = bake(mesh, W)
             if surface:
                 collision.setdefault(surface, Batch()).add(pos, None, None, idx)
             if not visible:
                 continue
             stats["meshes"] += 1
-            batches.setdefault((model, fi, mesh.material, None), Batch()).add(pos, nrm, uv, idx)
+            batches.setdefault((model, fi, mesh.material, None), Batch()).add(pos, nrm, uv, idx, tan)
             mat_name = model.materials[mesh.material].name
             for s in light_series:
                 if mat_name in s["materials"]:
@@ -611,9 +640,9 @@ def convert_car(car_dir: str, out_dir: str, skin_name: str | None = None):
         to_local = mat_inverse_affine(frame) if frame else IDENT
         batches: dict = {}
         for node, W, emissive in items:
-            pos, nrm, uv, idx = bake(node.mesh, mat_mul(W, to_local) if frame else W)
+            pos, nrm, uv, tan, idx = bake(node.mesh, mat_mul(W, to_local) if frame else W)
             key = (model, 0, node.mesh.material, emissive)
-            batches.setdefault(key, Batch()).add(pos, nrm, uv, idx)
+            batches.setdefault(key, Batch()).add(pos, nrm, uv, idx, tan)
         extra = {"matrix": list(frame)} if frame else None
         emit_batches(glb, gname, batches, matx, extra)
         tri_count += sum(b.tris for b in batches.values())
@@ -667,7 +696,7 @@ def convert_car(car_dir: str, out_dir: str, skin_name: str | None = None):
         pts = []
         for node, W, _ in walk_world(kn5.read(hull_path, load_textures=False).root):
             if node.mesh:
-                p, _, _, _ = bake(node.mesh, mat_mul(W, offset_m))
+                p, _, _, _, _ = bake(node.mesh, mat_mul(W, offset_m))
                 pts += list(zip(p[0::3], p[1::3], p[2::3]))
         if pts:
             hull = {"min": [round(min(q[i] for q in pts), 4) for i in range(3)],

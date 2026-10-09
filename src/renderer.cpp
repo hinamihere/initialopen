@@ -13,7 +13,10 @@ namespace {
 // Shaders (GLSL 4.1 core). Uniforms are vec4 arrays, matching sokol's std140 path.
 
 constexpr int kMaxLights = 16;
-constexpr int kFrameVec4 = 10 + 2 * kMaxLights;
+constexpr int kFrameVec4 = 10 + 2 * kMaxLights + 2;
+constexpr int kMatVec4 = 5;
+constexpr int kShadowVec4 = 9;
+constexpr int kShadowSize = 2048;
 constexpr int kSkyVec4 = 8;
 
 const char* kSceneVS = R"(#version 410
@@ -21,8 +24,10 @@ uniform vec4 vs_params[9];
 layout(location=0) in vec3 pos;
 layout(location=1) in vec3 nrm;
 layout(location=2) in vec2 uv0;
+layout(location=3) in vec4 tan0;
 out vec3 v_wpos;
 out vec3 v_nrm;
+out vec3 v_tan;
 out vec2 v_uv;
 out float v_emis;
 void main() {
@@ -30,6 +35,7 @@ void main() {
     mat4 model = mat4(vs_params[4], vs_params[5], vs_params[6], vs_params[7]);
     v_wpos = (model * vec4(pos, 1.0)).xyz;
     v_nrm = mat3(model) * nrm;
+    v_tan = mat3(model) * tan0.xyz;
     v_uv = uv0;
     v_emis = vs_params[8].x;
     gl_Position = mvp * vec4(pos, 1.0);
@@ -43,16 +49,27 @@ void main() {
 //  6: key light dir, -          7: key light rgb, -
 //  8: ambient sky rgb, -        9: ambient ground rgb, -
 // 10 + 2i: light pos, range    11 + 2i: light rgb
+// 42: zenith rgb, exposure     43: sun dir, sun visible
 // mat[] layout:
 //  0: emissive rgb, alpha cutoff (< 0 = opaque, -2 = blended)   1: base color
-//  2: detail enabled, detail uv scale
+//  2: has detail, detail uv scale, has normal map, has maps texture
+//  3: ksDiffuse, ksAmbient, ksSpecular, ksSpecularEXP
+//  4: fresnelC, fresnelEXP, fresnelMaxLevel, -
+// shadow[] layout: 0-3 near cascade matrix, 4-7 far cascade matrix,
+//  8: near texel (world m), far texel (world m), shadow map texel (uv), enabled
 const char* kSceneFS = R"(#version 410
-uniform vec4 frame[42];
-uniform vec4 mat[3];
+uniform vec4 frame[44];
+uniform vec4 mat[5];
+uniform vec4 shadow[9];
 uniform sampler2D tex;
 uniform sampler2D detail_tex;
+uniform sampler2D normal_tex;
+uniform sampler2D maps_tex;
+uniform sampler2DShadow shadow0;
+uniform sampler2DShadow shadow1;
 in vec3 v_wpos;
 in vec3 v_nrm;
+in vec3 v_tan;
 in vec2 v_uv;
 in float v_emis;
 out vec4 frag_color;
@@ -65,6 +82,37 @@ float beam(vec3 P, vec3 hp, vec3 dir, float cosOuter, float reach) {
     return cone / (1.0 + (d * d) / (reach * reach));
 }
 
+// 3x3 PCF on a hardware-compared shadow map; returns 1 outside the map.
+float pcf(sampler2DShadow s, mat4 m, vec3 p, out bool inside) {
+    vec4 c = m * vec4(p, 1.0);
+    vec3 q = c.xyz / c.w * 0.5 + 0.5;
+    inside = all(greaterThan(q.xy, vec2(0.01))) && all(lessThan(q.xy, vec2(0.99))) && q.z < 1.0;
+    if (!inside) return 1.0;
+    float t = shadow[8].z, sum = 0.0;
+    for (int y = -1; y <= 1; ++y)
+        for (int x = -1; x <= 1; ++x) sum += texture(s, vec3(q.xy + vec2(x, y) * t, q.z));
+    return sum / 9.0;
+}
+
+float sunShadow(vec3 N, vec3 L) {
+    if (shadow[8].w < 0.5) return 1.0;
+    float slope = 1.0 - max(dot(N, L), 0.0);
+    bool inside;
+    // Normal-offset sampling avoids acne without detaching shadows from their casters.
+    float s = pcf(shadow0, mat4(shadow[0], shadow[1], shadow[2], shadow[3]), v_wpos + N * shadow[8].x * (1.0 + 2.0 * slope), inside);
+    if (inside) return s;
+    s = pcf(shadow1, mat4(shadow[4], shadow[5], shadow[6], shadow[7]), v_wpos + N * shadow[8].y * (1.0 + 2.0 * slope), inside);
+    return s;
+}
+
+vec3 skyColor(vec3 R) {
+    vec3 horizon = frame[1].rgb, zenith = frame[42].rgb;
+    vec3 c = mix(horizon, zenith, pow(clamp(R.y, 0.0, 1.0), 0.45));
+    c = mix(c, horizon * 0.25, smoothstep(0.0, -0.3, R.y));  // ground below the horizon
+    c += frame[7].rgb * pow(max(dot(R, frame[43].xyz), 0.0), 300.0) * 6.0 * frame[43].w;  // sun glint
+    return c;
+}
+
 void main() {
     vec4 texel = texture(tex, v_uv) * mat[1];
     if (mat[2].x > 0.5) {
@@ -73,7 +121,6 @@ void main() {
         texel = vec4(mix(det, texel.rgb, texel.a), 1.0);
     }
     float cutoff = mat[0].w;
-    if (cutoff >= 0.0 && texel.a < cutoff) discard;
 
     vec3 cam = frame[0].xyz;
     vec3 horizon = frame[1].rgb;
@@ -87,17 +134,28 @@ void main() {
     float night = frame[5].z;
     vec3 keyDir = frame[6].xyz, keyCol = frame[7].rgb;
 
-    vec3 N = normalize(v_nrm);
-    if (!gl_FrontFacing) N = -N;
     vec3 V = cam - v_wpos;
     float dist = length(V);
     V /= dist;
+    vec3 Ng = normalize(v_nrm);
+    if (!gl_FrontFacing) Ng = -Ng;
+    vec3 N = Ng;
+    if (mat[2].z > 0.5 && dot(v_tan, v_tan) > 0.25) {
+        vec3 T = normalize(v_tan - Ng * dot(Ng, v_tan));
+        vec3 B = cross(Ng, T);
+        vec3 nm = texture(normal_tex, v_uv).xyz * 2.0 - 1.0;
+        N = normalize(T * nm.x - B * nm.y + Ng * max(nm.z, 0.2));  // Direct3D-style green channel
+    }
+    vec4 maps = mat[2].w > 0.5 ? texture(maps_tex, v_uv) : vec4(1.0);
+    float kd = mat[3].x * 2.5, ka = mat[3].y * 2.5;
+    float ks = mat[3].z * maps.r, kexp = max(mat[3].w * (mat[2].w > 0.5 ? maps.g : 1.0), 1.0);
     vec3 albedo = pow(texel.rgb, vec3(2.2));
 
-    // Sun or moon, plus a sky/ground ambient gradient.
-    vec3 light = mix(frame[9].rgb, frame[8].rgb, 0.5 + 0.5 * N.y);
-    light += keyCol * max(dot(N, keyDir), 0.0);
-    vec3 spec = keyCol * pow(max(dot(N, normalize(keyDir + V)), 0.0), 48.0) * 0.15;
+    float sh = sunShadow(Ng, keyDir);
+    vec3 diffuse = mix(frame[9].rgb, frame[8].rgb, 0.5 + 0.5 * N.y) * ka * (0.7 + 0.3 * sh);
+    vec3 spec = vec3(0.0);
+    diffuse += keyCol * max(dot(N, keyDir), 0.0) * sh * kd;
+    spec += keyCol * pow(max(dot(N, normalize(keyDir + V)), 0.0), kexp) * ks * sh;
 
     // Halogen headlights: warm white.
     vec3 hcol = vec3(1.0, 0.92, 0.78) * bint;
@@ -105,8 +163,8 @@ void main() {
         vec3 hp = k == 0 ? hl : hr;
         vec3 L = normalize(hp - v_wpos);
         float a = beam(v_wpos, hp, bdir, cosOuter, reach);
-        light += hcol * a * max(dot(N, L), 0.0);
-        spec += hcol * a * pow(max(dot(N, normalize(L + V)), 0.0), 40.0) * 0.35;
+        diffuse += hcol * a * max(dot(N, L), 0.0) * kd;
+        spec += hcol * a * pow(max(dot(N, normalize(L + V)), 0.0), kexp) * (ks + 0.05);
     }
     // Track lights (sodium streetlights, signs, ...), switched on at dusk.
     for (int i = 0; i < nLights; ++i) {
@@ -116,11 +174,17 @@ void main() {
         float d = length(L);
         L /= d;
         float a = 1.0 / (1.0 + d * d / 30.0) * smoothstep(lp.w, lp.w * 0.6, d);
-        light += lc * a * max(dot(N, L), 0.0);
-        spec += lc * a * pow(max(dot(N, normalize(L + V)), 0.0), 24.0) * 0.25;
+        diffuse += lc * a * max(dot(N, L), 0.0) * kd;
+        spec += lc * a * pow(max(dot(N, normalize(L + V)), 0.0), kexp) * (ks + 0.05);
     }
 
-    vec3 color = albedo * light + spec * 0.6 + albedo * mat[0].rgb * v_emis * 4.0;
+    vec3 color = albedo * diffuse + spec + albedo * mat[0].rgb * v_emis * 4.0;
+
+    // Reflections of the sky (paint, glass, chrome): Schlick-style fresnel as in AC.
+    if (mat[4].z > 0.0) {
+        float f = mat[4].x + (1.0 - mat[4].x) * pow(1.0 - max(dot(N, V), 0.0), mat[4].y);
+        color += skyColor(reflect(-V, N)) * min(f, mat[4].z) * maps.b;
+    }
 
     // Fog takes the sky's horizon color (brighter toward the sun), plus light
     // scattered toward the camera by the fog at night.
@@ -141,9 +205,32 @@ void main() {
     }
     color = mix(fogCol, color, fog) + scatter * 0.34 * (0.15 + 0.85 * night);
 
-    color = vec3(1.0) - exp(-color * 1.7);  // soft shoulder, like tape saturating
-    float alpha = cutoff < -1.5 ? texel.a : 1.0;  // blended materials keep texture alpha
+    color = vec3(1.0) - exp(-color * frame[42].w);  // exposure + soft highlight shoulder
+    float alpha = 1.0;
+    if (cutoff < -1.5) alpha = texel.a;  // blended
+    else if (cutoff >= 0.0) alpha = clamp((texel.a - cutoff) / max(fwidth(texel.a), 1e-4) + 0.5, 0.0, 1.0);  // alpha to coverage
     frag_color = vec4(pow(color, vec3(1.0 / 2.2)), alpha);
+}
+)";
+
+// Shadow map pass: depth only; alpha-tested materials cut out their texture.
+const char* kShadowVS = R"(#version 410
+uniform vec4 sh_vs[4];
+layout(location=0) in vec3 pos;
+layout(location=1) in vec2 uv0;
+out vec2 v_uv;
+void main() {
+    v_uv = uv0;
+    gl_Position = mat4(sh_vs[0], sh_vs[1], sh_vs[2], sh_vs[3]) * vec4(pos, 1.0);
+}
+)";
+
+const char* kShadowFS = R"(#version 410
+uniform vec4 sh_fs[1];
+uniform sampler2D tex;
+in vec2 v_uv;
+void main() {
+    if (sh_fs[0].x >= 0.0 && texture(tex, v_uv).a < sh_fs[0].x) discard;
 }
 )";
 
@@ -212,7 +299,7 @@ void main() {
         col = mix(col, cloudCol, c * 0.75 * smoothstep(0.0, 0.15, h));
     }
 
-    col = vec3(1.0) - exp(-col * 1.7);
+    col = vec3(1.0) - exp(-col * sky[6].w);
     frag_color = vec4(pow(col, vec3(1.0 / 2.2)), 1.0);
 }
 )";
@@ -374,13 +461,19 @@ void solidUV(float& u, float& v) {
 }
 
 struct GpuMaterial {
-    sg_view tex{}, detail{};
-    float params[3][4];  // see kSceneFS mat[] layout
-    int pass = 0;        // 0 opaque/cull, 1 opaque/two-sided, 2 blended
+    sg_view tex{}, detail{}, normal{}, maps{};
+    float params[kMatVec4][4];  // see kSceneFS mat[] layout
+    int pass = 0;               // 0 opaque/cull, 1 opaque/two-sided, 2 blended, 3 alpha-tested
 };
 
+// Draw order of the passes: opaque, two-sided, alpha-tested, then blended.
+int passOrder(int pass) {
+    static const int order[4] = {0, 1, 3, 2};
+    return order[pass];
+}
+
 struct GpuModel {
-    sg_buffer pos{}, nrm{}, uv{}, idx{};
+    sg_buffer pos{}, nrm{}, uv{}, tan{}, idx{};
     std::vector<sg_image> images;
     std::vector<sg_view> views;
     std::vector<GpuMaterial> materials;
@@ -410,8 +503,12 @@ sg_buffer makeBuffer(const void* data, size_t size, bool index, const char* labe
 // ---------------------------------------------------------------------------
 
 struct Renderer::Gpu {
-    sg_shader sceneShd{}, osdShd{}, postShd{}, skyShd{};
-    sg_pipeline scenePip[3]{}, osdPip{}, postPip{}, skyPip{};
+    sg_shader sceneShd{}, osdShd{}, postShd{}, skyShd{}, shadowShd{};
+    sg_pipeline scenePip[4]{}, osdPip{}, postPip{}, skyPip{}, shadowPip{};
+    // Sun/moon shadow cascades (near, far).
+    sg_image shadowImg[2]{};
+    sg_view shadowAtt[2]{}, shadowTex[2]{};
+    sg_sampler shadowSmp{};
     // Scene target: MSAA color + depth, resolved into a texture for the post pass.
     static constexpr int kMsaa = 4;
     int targetW = 0, targetH = 0;
@@ -488,8 +585,8 @@ bool Renderer::init() {
         sg_shader_desc sd = {};
         sd.vertex_func.source = kSceneVS;
         sd.fragment_func.source = kSceneFS;
-        const char* names[3] = {"pos", "nrm", "uv0"};
-        for (int k = 0; k < 3; ++k) {
+        const char* names[4] = {"pos", "nrm", "uv0", "tan0"};
+        for (int k = 0; k < 4; ++k) {
             sd.attrs[k].glsl_name = names[k];
             sd.attrs[k].base_type = SG_SHADERATTRBASETYPE_FLOAT;
         }
@@ -502,27 +599,36 @@ bool Renderer::init() {
         sd.uniform_blocks[1].layout = SG_UNIFORMLAYOUT_STD140;
         sd.uniform_blocks[1].glsl_uniforms[0] = {SG_UNIFORMTYPE_FLOAT4, kFrameVec4, "frame"};
         sd.uniform_blocks[2].stage = SG_SHADERSTAGE_FRAGMENT;
-        sd.uniform_blocks[2].size = 3 * 16;
+        sd.uniform_blocks[2].size = kMatVec4 * 16;
         sd.uniform_blocks[2].layout = SG_UNIFORMLAYOUT_STD140;
-        sd.uniform_blocks[2].glsl_uniforms[0] = {SG_UNIFORMTYPE_FLOAT4, 3, "mat"};
-        for (int v = 0; v < 2; ++v) {
+        sd.uniform_blocks[2].glsl_uniforms[0] = {SG_UNIFORMTYPE_FLOAT4, kMatVec4, "mat"};
+        sd.uniform_blocks[3].stage = SG_SHADERSTAGE_FRAGMENT;
+        sd.uniform_blocks[3].size = kShadowVec4 * 16;
+        sd.uniform_blocks[3].layout = SG_UNIFORMLAYOUT_STD140;
+        sd.uniform_blocks[3].glsl_uniforms[0] = {SG_UNIFORMTYPE_FLOAT4, kShadowVec4, "shadow"};
+        for (int v = 0; v < 6; ++v) {
             sd.views[v].texture.stage = SG_SHADERSTAGE_FRAGMENT;
             sd.views[v].texture.image_type = SG_IMAGETYPE_2D;
-            sd.views[v].texture.sample_type = SG_IMAGESAMPLETYPE_FLOAT;
+            sd.views[v].texture.sample_type = v < 4 ? SG_IMAGESAMPLETYPE_FLOAT : SG_IMAGESAMPLETYPE_DEPTH;
         }
         sd.samplers[0].stage = SG_SHADERSTAGE_FRAGMENT;
         sd.samplers[0].sampler_type = SG_SAMPLERTYPE_FILTERING;
-        sd.texture_sampler_pairs[0] = {SG_SHADERSTAGE_FRAGMENT, 0, 0, "tex"};
-        sd.texture_sampler_pairs[1] = {SG_SHADERSTAGE_FRAGMENT, 1, 0, "detail_tex"};
+        sd.samplers[1].stage = SG_SHADERSTAGE_FRAGMENT;
+        sd.samplers[1].sampler_type = SG_SAMPLERTYPE_COMPARISON;
+        const char* texNames[6] = {"tex", "detail_tex", "normal_tex", "maps_tex", "shadow0", "shadow1"};
+        for (int v = 0; v < 6; ++v)
+            sd.texture_sampler_pairs[v] = {SG_SHADERSTAGE_FRAGMENT, uint8_t(v), uint8_t(v < 4 ? 0 : 1), texNames[v]};
         sd.label = "scene-shader";
         g.sceneShd = sg_make_shader(&sd);
 
-        for (int pass = 0; pass < 3; ++pass) {
+        for (int pass = 0; pass < 4; ++pass) {
             sg_pipeline_desc pd = {};
             pd.shader = g.sceneShd;
             pd.layout.attrs[0] = {0, 0, SG_VERTEXFORMAT_FLOAT3};
             pd.layout.attrs[1] = {1, 0, SG_VERTEXFORMAT_FLOAT3};
             pd.layout.attrs[2] = {2, 0, SG_VERTEXFORMAT_FLOAT2};
+            pd.layout.attrs[3] = {3, 0, SG_VERTEXFORMAT_FLOAT4};
+            pd.alpha_to_coverage_enabled = pass == 3;  // smooth foliage edges under MSAA
             pd.index_type = SG_INDEXTYPE_UINT32;
             pd.cull_mode = pass == 0 ? SG_CULLMODE_BACK : SG_CULLMODE_NONE;
             // Converted AC meshes are counter-clockwise in our right-handed space.
@@ -538,6 +644,71 @@ bool Renderer::init() {
             pd.label = "scene-pipeline";
             g.scenePip[pass] = sg_make_pipeline(&pd);
         }
+    }
+
+    // Shadow map shader, pipeline and cascade images.
+    {
+        sg_shader_desc sd = {};
+        sd.vertex_func.source = kShadowVS;
+        sd.fragment_func.source = kShadowFS;
+        sd.attrs[0].glsl_name = "pos";
+        sd.attrs[1].glsl_name = "uv0";
+        sd.uniform_blocks[0].stage = SG_SHADERSTAGE_VERTEX;
+        sd.uniform_blocks[0].size = 4 * 16;
+        sd.uniform_blocks[0].layout = SG_UNIFORMLAYOUT_STD140;
+        sd.uniform_blocks[0].glsl_uniforms[0] = {SG_UNIFORMTYPE_FLOAT4, 4, "sh_vs"};
+        sd.uniform_blocks[1].stage = SG_SHADERSTAGE_FRAGMENT;
+        sd.uniform_blocks[1].size = 16;
+        sd.uniform_blocks[1].layout = SG_UNIFORMLAYOUT_STD140;
+        sd.uniform_blocks[1].glsl_uniforms[0] = {SG_UNIFORMTYPE_FLOAT4, 1, "sh_fs"};
+        sd.views[0].texture.stage = SG_SHADERSTAGE_FRAGMENT;
+        sd.views[0].texture.image_type = SG_IMAGETYPE_2D;
+        sd.views[0].texture.sample_type = SG_IMAGESAMPLETYPE_FLOAT;
+        sd.samplers[0].stage = SG_SHADERSTAGE_FRAGMENT;
+        sd.samplers[0].sampler_type = SG_SAMPLERTYPE_FILTERING;
+        sd.texture_sampler_pairs[0] = {SG_SHADERSTAGE_FRAGMENT, 0, 0, "tex"};
+        sd.label = "shadow-shader";
+        g.shadowShd = sg_make_shader(&sd);
+
+        sg_pipeline_desc pd = {};
+        pd.shader = g.shadowShd;
+        pd.layout.attrs[0] = {0, 0, SG_VERTEXFORMAT_FLOAT3};
+        pd.layout.attrs[1] = {1, 0, SG_VERTEXFORMAT_FLOAT2};
+        pd.index_type = SG_INDEXTYPE_UINT32;
+        pd.cull_mode = SG_CULLMODE_NONE;
+        pd.color_count = 0;
+        pd.depth.pixel_format = SG_PIXELFORMAT_DEPTH;
+        pd.depth.compare = SG_COMPAREFUNC_LESS_EQUAL;
+        pd.depth.write_enabled = true;
+        pd.depth.bias = 1.0f;
+        pd.depth.bias_slope_scale = 2.0f;
+        pd.sample_count = 1;
+        pd.label = "shadow-pipeline";
+        g.shadowPip = sg_make_pipeline(&pd);
+
+        for (int c = 0; c < 2; ++c) {
+            sg_image_desc d = {};
+            d.usage.depth_stencil_attachment = true;
+            d.width = kShadowSize;
+            d.height = kShadowSize;
+            d.pixel_format = SG_PIXELFORMAT_DEPTH;
+            d.sample_count = 1;
+            d.label = "shadow-cascade";
+            g.shadowImg[c] = sg_make_image(&d);
+            sg_view_desc v = {};
+            v.depth_stencil_attachment.image = g.shadowImg[c];
+            g.shadowAtt[c] = sg_make_view(&v);
+            v = {};
+            v.texture.image = g.shadowImg[c];
+            g.shadowTex[c] = sg_make_view(&v);
+        }
+        sg_sampler_desc sm = {};
+        sm.min_filter = SG_FILTER_LINEAR;
+        sm.mag_filter = SG_FILTER_LINEAR;
+        sm.wrap_u = SG_WRAP_CLAMP_TO_EDGE;
+        sm.wrap_v = SG_WRAP_CLAMP_TO_EDGE;
+        sm.compare = SG_COMPAREFUNC_LESS_EQUAL;
+        g.shadowSmp = sg_make_sampler(&sm);
     }
 
     // Sky shader and pipeline: fullscreen, behind everything.
@@ -700,6 +871,7 @@ int Renderer::addModel(const ModelData& m) {
     gm->pos = makeBuffer(m.pos.data(), m.pos.size() * 4, false, "model-pos");
     gm->nrm = makeBuffer(m.nrm.data(), m.nrm.size() * 4, false, "model-nrm");
     gm->uv = makeBuffer(m.uv.data(), m.uv.size() * 4, false, "model-uv");
+    gm->tan = makeBuffer(m.tan.data(), m.tan.size() * 4, false, "model-tan");
     gm->idx = makeBuffer(m.idx.data(), m.idx.size() * 4, true, "model-idx");
 
     for (const ImageData& im : m.images) {
@@ -728,14 +900,26 @@ int Renderer::addModel(const ModelData& m) {
         auto viewOf = [&](int image) { return (image >= 0 && image < int(gm->views.size())) ? gm->views[image] : g.whiteTex; };
         gmat.tex = viewOf(md.image);
         gmat.detail = viewOf(md.detailImage);
+        gmat.normal = viewOf(md.normalImage);
+        gmat.maps = viewOf(md.mapsImage);
+        std::memset(gmat.params, 0, sizeof(gmat.params));
         gmat.params[2][0] = md.detailImage >= 0 ? 1.0f : 0.0f;
         gmat.params[2][1] = md.detailUv;
+        gmat.params[2][2] = md.normalImage >= 0 ? 1.0f : 0.0f;
+        gmat.params[2][3] = md.mapsImage >= 0 ? 1.0f : 0.0f;
+        gmat.params[3][0] = md.ksDiffuse;
+        gmat.params[3][1] = md.ksAmbient;
+        gmat.params[3][2] = md.ksSpecular;
+        gmat.params[3][3] = md.ksSpecularExp;
+        gmat.params[4][0] = md.fresnelC;
+        gmat.params[4][1] = md.fresnelExp;
+        gmat.params[4][2] = md.fresnelMax;
         gmat.params[0][0] = md.emissive[0];
         gmat.params[0][1] = md.emissive[1];
         gmat.params[0][2] = md.emissive[2];
         gmat.params[0][3] = md.alpha == MaterialData::Mask ? md.cutoff : (md.alpha == MaterialData::Blend ? -2.0f : -1.0f);
         std::memcpy(gmat.params[1], md.baseColor, sizeof(md.baseColor));
-        gmat.pass = md.alpha == MaterialData::Blend ? 2 : (md.doubleSided ? 1 : 0);
+        gmat.pass = md.alpha == MaterialData::Blend ? 2 : md.alpha == MaterialData::Mask ? 3 : (md.doubleSided ? 1 : 0);
         gm->materials.push_back(gmat);
     }
     gm->groups = m.groups;
@@ -747,7 +931,7 @@ void Renderer::submit(int model, int group, const M4& xf, float emissiveScale) {
     if (model < 0 || model >= int(gpu->models.size())) return;
     const GpuModel* gm = gpu->models[model].get();
     if (group < 0 || group >= int(gm->groups.size())) return;
-    static const GpuMaterial fallback = {{}, {}, {{0, 0, 0, -1}, {1, 1, 1, 1}, {0, 1, 0, 0}}, 0};
+    static const GpuMaterial fallback = {{}, {}, {}, {}, {{0, 0, 0, -1}, {1, 1, 1, 1}, {0, 1, 0, 0}, {0.4f, 0.4f, 0, 20}, {0, 5, 0, 0}}, 0};
     for (const Primitive& p : gm->groups[group].prims) {
         const GpuMaterial* mat = (p.material >= 0 && p.material < int(gm->materials.size())) ? &gm->materials[p.material] : &fallback;
         gpu->queue.push_back({gm, &p, mat, xf, emissiveScale, 0.0f});
@@ -790,6 +974,8 @@ void Renderer::render(const RenderView& rv, int fbW, int fbH) {
         }
     }
     set4(5, {float(nLights), smoothstep(0.15f, 0.6f, env.night), env.night}, 0);
+    set4(42, env.zenith, lerpf(1.9f, 1.45f, env.day));
+    set4(43, env.sunDir, smoothstep(-0.03f, 0.02f, env.sunDir.y));
 
     // Sky uniforms: camera basis from the view matrix rows, frustum extents from the projection.
     float skyU[kSkyVec4][4] = {};
@@ -802,7 +988,7 @@ void Renderer::render(const RenderView& rv, int fbW, int fbH) {
     sky4(3, env.sunDir, smoothstep(-0.03f, 0.02f, env.sunDir.y));
     sky4(4, env.sunColor, env.night);
     sky4(5, env.zenith, env.sunset);
-    sky4(6, env.horizon, 0);
+    sky4(6, env.horizon, lerpf(1.9f, 1.45f, env.day));
     sky4(7, env.moonDir, 0);
 
     // OSD vertices must be written before the buffer is bound.
@@ -821,9 +1007,57 @@ void Renderer::render(const RenderView& rv, int fbW, int fbH) {
         d.depth = dot(c, c);
     }
     std::stable_sort(g.queue.begin(), g.queue.end(), [](const DrawItem& a, const DrawItem& b) {
-        if (a.mat->pass != b.mat->pass) return a.mat->pass < b.mat->pass;
+        if (a.mat->pass != b.mat->pass) return passOrder(a.mat->pass) < passOrder(b.mat->pass);
         return a.mat->pass == 2 ? a.depth > b.depth : false;
     });
+
+    // --- Shadow cascades for the sun (or moon): spheres in front of the camera, fitted
+    // to a light-space ortho box and snapped to whole texels so edges don't crawl.
+    float shadowU[kShadowVec4][4] = {};
+    const bool shadowsOn = (env.keyColor.x + env.keyColor.y + env.keyColor.z) > 0.01f;
+    if (shadowsOn) {
+        V3 L = normalize(env.keyDir);
+        V3 camFwdFlat = normalize(V3{-rv.view.m[2], 0.0f, -rv.view.m[10]});
+        const float radius[2] = {30.0f, 160.0f};
+        for (int c = 0; c < 2; ++c) {
+            V3 center = rv.camPos + camFwdFlat * (radius[c] * 0.6f);
+            V3 up = std::fabs(L.y) > 0.95f ? V3{1, 0, 0} : V3{0, 1, 0};
+            M4 view = lookAt(center + L * (radius[c] * 3.0f), center, up);
+            float texel = 2.0f * radius[c] / kShadowSize;
+            V3 o = view.transformPoint({0, 0, 0});
+            view = translation({std::round(o.x / texel) * texel - o.x, std::round(o.y / texel) * texel - o.y, 0}) * view;
+            M4 proj = ortho(-radius[c], radius[c], -radius[c], radius[c], 0.1f, radius[c] * 6.0f);
+            M4 lightVP = proj * view;
+            std::memcpy(shadowU[c * 4], lightVP.m, 64);
+            shadowU[8][c] = texel;
+
+            sg_pass sp = {};
+            sp.action.depth.load_action = SG_LOADACTION_CLEAR;
+            sp.action.depth.clear_value = 1.0f;
+            sp.action.depth.store_action = SG_STOREACTION_STORE;
+            sp.attachments.depth_stencil = g.shadowAtt[c];
+            sg_begin_pass(&sp);
+            sg_apply_pipeline(g.shadowPip);
+            for (const DrawItem& d : g.queue) {
+                if (d.mat->pass == 2) continue;  // glass and other blended surfaces cast no shadow
+                M4 mvp = lightVP * d.xf;
+                sg_apply_uniforms(0, {mvp.m, 64});
+                float fs[4] = {d.mat->params[0][3], 0, 0, 0};
+                sg_apply_uniforms(1, {fs, sizeof(fs)});
+                sg_bindings b = {};
+                b.vertex_buffers[0] = d.model->pos;
+                b.vertex_buffers[1] = d.model->uv;
+                b.index_buffer = d.model->idx;
+                b.views[0] = d.mat->tex.id ? d.mat->tex : g.whiteTex;
+                b.samplers[0] = g.materialSmp;
+                sg_apply_bindings(&b);
+                sg_draw(int(d.prim->firstIndex), int(d.prim->indexCount), 1);
+            }
+            sg_end_pass();
+        }
+        shadowU[8][2] = 1.0f / kShadowSize;
+        shadowU[8][3] = 1.0f;
+    }
 
     // --- Scene pass, multisampled, at the chosen fraction of window resolution.
     int tw = std::max(320, int(float(fbW) * rv.renderScale + 0.5f));
@@ -846,6 +1080,7 @@ void Renderer::render(const RenderView& rv, int fbW, int fbH) {
             currentPass = d.mat->pass;
             sg_apply_pipeline(g.scenePip[currentPass]);
             sg_apply_uniforms(1, {frame, sizeof(frame)});
+            sg_apply_uniforms(3, {shadowU, sizeof(shadowU)});
         }
         float vs[9][4] = {};
         M4 mvp = viewProj * d.xf;
@@ -858,10 +1093,16 @@ void Renderer::render(const RenderView& rv, int fbW, int fbH) {
         b.vertex_buffers[0] = d.model->pos;
         b.vertex_buffers[1] = d.model->nrm;
         b.vertex_buffers[2] = d.model->uv;
+        b.vertex_buffers[3] = d.model->tan;
         b.index_buffer = d.model->idx;
         b.views[0] = d.mat->tex.id ? d.mat->tex : g.whiteTex;
         b.views[1] = d.mat->detail.id ? d.mat->detail : g.whiteTex;
+        b.views[2] = d.mat->normal.id ? d.mat->normal : g.whiteTex;
+        b.views[3] = d.mat->maps.id ? d.mat->maps : g.whiteTex;
+        b.views[4] = g.shadowTex[0];
+        b.views[5] = g.shadowTex[1];
         b.samplers[0] = g.materialSmp;
+        b.samplers[1] = g.shadowSmp;
         sg_apply_bindings(&b);
         sg_draw(int(d.prim->firstIndex), int(d.prim->indexCount), 1);
     }

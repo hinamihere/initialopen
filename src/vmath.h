@@ -79,6 +79,17 @@ inline M4 lookAt(V3 eye, V3 target, V3 up) {
     return r;
 }
 
+inline M4 ortho(float l, float r, float b, float t, float n, float f) {
+    M4 m = M4::identity();
+    m.m[0] = 2.0f / (r - l);
+    m.m[5] = 2.0f / (t - b);
+    m.m[10] = -2.0f / (f - n);
+    m.m[12] = -(r + l) / (r - l);
+    m.m[13] = -(t + b) / (t - b);
+    m.m[14] = -(f + n) / (f - n);
+    return m;
+}
+
 inline M4 translation(V3 t) {
     M4 r = M4::identity();
     r.m[12] = t.x; r.m[13] = t.y; r.m[14] = t.z;
