@@ -70,6 +70,10 @@ struct SuspensionFeel {
     float dampingRatio = 0.40f;   // fraction of critical damping
     float bumpTravel = 0.10f;     // m of compression available from ride height
     float arbScale = 0.30f;       // multiplier on the mod's anti-roll bar rates
+    // Tyre forces act at this fraction of the way from the contact patch up to the
+    // center of gravity: a stand-in for anti-squat / anti-dive suspension geometry.
+    float antiDiveFront = 0.35f;
+    float antiSquatRear = 0.55f;
 };
 constexpr SuspensionFeel kFeel;
 
@@ -197,20 +201,25 @@ void Physics::createCar(const CarSpec& spec, V3 pos, V3 fwd) {
         ws->mMaxBrakeTorque = spec.brakeTorque * (front ? spec.brakeFrontShare : 1.0f - spec.brakeFrontShare);
         ws->mMaxHandBrakeTorque = front ? 0.0f : std::max(spec.handbrakeTorque, 1500.0f);
         ws->mInertia = 1.2f;
-        // Grip peaks at the tyre's friction limit angle, then falls off gently so
-        // slides stay controllable instead of snapping.
+        float ground = s.pos.y - s.radius;
+        ws->mEnableSuspensionForcePoint = true;
+        ws->mSuspensionForcePoint = Vec3(s.pos.x, ground * (1.0f - (front ? kFeel.antiDiveFront : kFeel.antiSquatRear)), s.pos.z);
+        // Grip builds progressively with slip angle, peaks at the tyre's friction limit
+        // angle and then barely drops, so a slide stays a slide you can hold and adjust.
         float a = std::max(s.frictionLimitAngle, 3.0f);
         ws->mLateralFriction.Clear();
         ws->mLateralFriction.AddPoint(0.0f, 0.0f);
+        ws->mLateralFriction.AddPoint(a * 0.5f, s.dy0 * 0.75f);
         ws->mLateralFriction.AddPoint(a, s.dy0);
-        ws->mLateralFriction.AddPoint(a * 2.5f, s.dy0 * 0.93f);
-        ws->mLateralFriction.AddPoint(40.0f, s.dy0 * 0.82f);
-        ws->mLateralFriction.AddPoint(90.0f, s.dy0 * 0.75f);
+        ws->mLateralFriction.AddPoint(a * 2.5f, s.dy0 * 0.98f);
+        ws->mLateralFriction.AddPoint(35.0f, s.dy0 * 0.94f);
+        ws->mLateralFriction.AddPoint(90.0f, s.dy0 * 0.88f);
         ws->mLongitudinalFriction.Clear();
         ws->mLongitudinalFriction.AddPoint(0.0f, 0.0f);
-        ws->mLongitudinalFriction.AddPoint(0.1f, s.dx0);
-        ws->mLongitudinalFriction.AddPoint(0.3f, s.dx0 * 0.9f);
-        ws->mLongitudinalFriction.AddPoint(1.0f, s.dx0 * 0.78f);
+        ws->mLongitudinalFriction.AddPoint(0.06f, s.dx0 * 0.8f);
+        ws->mLongitudinalFriction.AddPoint(0.12f, s.dx0);
+        ws->mLongitudinalFriction.AddPoint(0.4f, s.dx0 * 0.93f);
+        ws->mLongitudinalFriction.AddPoint(1.0f, s.dx0 * 0.85f);
         vs.mWheels.push_back(ws);
     }
     vs.mAntiRollBars.resize(2);
@@ -311,11 +320,16 @@ void Physics::step(float dt, CarInput& in) {
     float vFwd = vel.Dot(fwd), vRight = vel.Dot(right);
     float speed = vel.Length();
 
-    // Steering: less lock at speed, plus a little automatic counter-steer toward
-    // the direction of travel so slides feel controllable on a pad or keyboard.
-    float lock = I.maxSteer * (1.0f - 0.6f * std::clamp(speed / 45.0f, 0.0f, 1.0f));
+    // Steering: the player's input maps directly to wheel angle, with only mild lock
+    // reduction at speed. A small counter-steer nudge kicks in only in real slides
+    // (beyond ~6 degrees of body slip) to help keyboard players catch them.
+    float lock = I.maxSteer * (1.0f - 0.35f * std::clamp(speed / 45.0f, 0.0f, 1.0f));
     float desired = in.steer * lock;
-    if (speed > 4.0f && vFwd > 0) desired += std::atan2(vRight, std::max(vFwd, 0.1f)) * 0.45f;
+    if (speed > 5.0f && vFwd > 0) {
+        float beta = std::atan2(vRight, std::max(vFwd, 0.1f));
+        float excess = std::copysign(std::max(std::fabs(beta) - 0.1f, 0.0f), beta);
+        desired += excess * 0.15f;
+    }
     float rightIn = std::clamp(desired / I.maxSteer, -1.0f, 1.0f);
 
     float forward = in.throttle, brake = in.brake;

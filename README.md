@@ -49,6 +49,19 @@ What gets converted:
 
 Encrypted cars (`data.acd` only) are not supported yet.
 
+## Real car sounds (optional, FMOD)
+
+AC cars ship their sounds as FMOD Studio banks, which the converter copies to
+`assets/cars/<car>/sfx/`. FMOD is proprietary, so it is not part of this repo;
+without it the game uses a placeholder synth. To hear the car's real sounds:
+
+1. Download the **FMOD Engine** for Windows (2.x) from https://www.fmod.com/download
+   (free account, FMOD license terms apply).
+2. Copy `api/core/lib/x64/fmod.dll` and `api/studio/lib/x64/fmodstudio.dll` next to
+   `initialopen.exe` (or into a `fmod/` folder beside it).
+
+The console then prints which bank events were found and their parameters.
+
 ## Run
 
 ```bash

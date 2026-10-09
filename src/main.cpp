@@ -192,7 +192,10 @@ int main(int argc, char** argv) {
     // Requested marker first, then the usual AC fallbacks; skip markers with no physics under them.
     V3 spawnPos{}, spawnFwd{0, 0, 1};
     std::string spawnName;
+    std::vector<std::string> tried;
     for (const std::string& want : {opt.spawn, std::string("AC_PIT_0"), std::string("AC_HOTLAP_START_0"), std::string("AC_START_0")}) {
+        if (std::find(tried.begin(), tried.end(), want) != tried.end()) continue;
+        tried.push_back(want);
         const Spawn* s = trackInfo.findSpawn(want);
         bool ok = false;
         if (s) spawnPos = onGround(s->pos, ok);
@@ -219,7 +222,7 @@ int main(int argc, char** argv) {
     std::printf("Loaded '%s' + '%s' in %.2fs\n", trackInfo.name.c_str(), carSpec.name.c_str(), loadSec);
 
     CarAudio audio;
-    bool audioOk = opt.screenshot.empty() && audio.init();
+    bool audioOk = opt.screenshot.empty() && audio.init(opt.car, fs::path(std::u8string(reinterpret_cast<const char8_t*>(opt.car.data()), opt.car.size())).filename().string());
 
     // --- State.
     CarInput input;
@@ -241,6 +244,9 @@ int main(int argc, char** argv) {
     double simTime = 0, accumulator = 0;
     const double step = 1.0 / 120.0;
     float camShake = 0;
+    // Driver's head: lags behind the shell under g-forces (sense of weight).
+    V3 headOffset{}, prevVel{};
+    float lookYaw = 0;
     int frame = 0, aiHint = -1;
     SDL_Gamepad* pad = nullptr;
     auto last = std::chrono::steady_clock::now();
@@ -365,7 +371,18 @@ int main(int argc, char** argv) {
             ++steps;
         }
         car = physics.state();
-        if (audioOk) audio.update(car.rpm, car.maxRpm, input.throttle, car.speed, car.slip, car.gear);
+        if (audioOk) {
+            CarSound snd;
+            snd.rpm = car.rpm;
+            snd.maxRpm = car.maxRpm;
+            snd.throttle = input.throttle;
+            snd.speedMs = car.speed;
+            snd.slip = car.slip;
+            snd.boost = std::clamp(input.throttle * (car.rpm / car.maxRpm) * 1.4f - 0.2f, 0.0f, 1.0f);
+            snd.gear = car.gear;
+            snd.interior = cockpit;
+            audio.update(snd);
+        }
         if (opt.telemetry && int(simTime * 10) != int((simTime - steps * step) * 10)) {
             float pitch = std::asin(std::clamp(car.fwd.y, -1.0f, 1.0f)) * 57.3f;
             float roll = std::asin(std::clamp(car.right.y, -1.0f, 1.0f)) * 57.3f;
@@ -385,9 +402,23 @@ int main(int argc, char** argv) {
         V3 jitter{std::sin(t * 61.0f) * camShake, std::sin(t * 47.0f + 1.3f) * camShake, 0};
         if (cockpit) {
             // Roll-cage mount: rigid with the shell, so pitch, roll and vibration come through.
-            V3 eye = B.transformPoint(carSpec.driverEyes + jitter);
+            // Body-space acceleration pushes the head the other way (braking leans you
+            // forward, corners push you outward), then a soft spring brings it back.
+            if (steps > 0) {
+                float pdt = float(steps * step);
+                V3 accel = (car.vel - prevVel) * (1.0f / pdt);
+                V3 localAcc{-dot(accel, car.right), dot(accel, car.up), dot(accel, car.fwd)};  // body space, +X = left
+                V3 headTarget{clampf(-localAcc.x * 0.006f, -0.07f, 0.07f), clampf(-localAcc.y * 0.002f, -0.03f, 0.03f),
+                              clampf(-localAcc.z * 0.005f, -0.06f, 0.06f)};
+                headOffset = headOffset + (headTarget - headOffset) * std::min(1.0f, pdt * 6.0f);
+            }
+            // Look slightly into the direction of travel when the car rotates or slides.
+            V3 flatVel{car.vel.x, 0, car.vel.z};
+            float slideYaw = length(flatVel) > 3.0f ? std::atan2(dot(flatVel, car.right) * -1.0f, std::max(dot(flatVel, car.fwd), 0.5f)) : 0.0f;
+            lookYaw += (clampf(slideYaw * 0.35f, -0.25f, 0.25f) - lookYaw) * std::min(1.0f, dt * 4.0f);
+            V3 eye = B.transformPoint(carSpec.driverEyes + headOffset + jitter);
             float pitch = carSpec.onboardPitchDeg * 3.14159f / 180.0f;
-            V3 look = normalize(B.transformDir({0, std::sin(pitch), std::cos(pitch)}));
+            V3 look = normalize(B.transformDir({std::sin(lookYaw), std::sin(pitch), std::cos(lookYaw) * std::cos(pitch)}));
             rv.view = lookAt(eye, eye + look, B.transformDir({0, 1, 0}));
             rv.proj = perspective(56.0f * 3.14159f / 180.0f, 4.0f / 3.0f, 0.05f, 2000.0f);
             rv.camPos = eye;
@@ -398,6 +429,7 @@ int main(int argc, char** argv) {
             rv.proj = perspective(50.0f * 3.14159f / 180.0f, 4.0f / 3.0f, 0.1f, 2000.0f);
             rv.camPos = eye;
         }
+        prevVel = car.vel;
         rv.lightsOn = lightsOn;
         rv.env = environmentAt(timeOfDay);
         rv.highBeam = highBeam;

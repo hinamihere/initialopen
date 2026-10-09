@@ -19,6 +19,7 @@ import json
 import math
 import os
 import re
+import shutil
 import struct
 import sys
 import time
@@ -710,6 +711,14 @@ def convert_car(car_dir: str, out_dir: str, skin_name: str | None = None):
                    "handbrake_torque": num(brakes.get("HANDBRAKE_TORQUE", 800))},
     }
     os.makedirs(out_dir, exist_ok=True)
+    # Sound: the mod's FMOD Studio bank plus GUIDs.txt (event ids; there is no strings bank).
+    sfx_src, sfx_dst = os.path.join(car_dir, "sfx"), os.path.join(out_dir, "sfx")
+    sfx_files = [f for f in os.listdir(sfx_src) if f.lower().endswith(".bank") or f == "GUIDs.txt"] if os.path.isdir(sfx_src) else []
+    if sfx_files:
+        os.makedirs(sfx_dst, exist_ok=True)
+        for f in sfx_files:
+            shutil.copyfile(os.path.join(sfx_src, f), os.path.join(sfx_dst, f))
+    meta["sound_bank"] = next((f"sfx/{f}" for f in sfx_files if f.lower().endswith(".bank")), None)
     glb_path = os.path.join(out_dir, "car.glb")
     glb.write(glb_path)
     with open(os.path.join(out_dir, "car.json"), "w", encoding="utf-8") as f:
@@ -720,6 +729,7 @@ def convert_car(car_dir: str, out_dir: str, skin_name: str | None = None):
     print(f"  textures: {len(matx.tex_cache)} ({matx.texture_bytes / 2**20:.1f} MB after mip trim)")
     print(f"  {meta['mass']:.0f} kg, {meta['drivetrain']['type']}, {gear_count} gears, "
           f"{len(meta['engine']['power_lut'])}-point torque curve, {len(turbos)} turbo(s)")
+    print(f"  sound: {meta['sound_bank'] or 'none'}")
     print(f"  car.glb {mb(glb_path):.1f} MB, {time.time() - t0:.1f}s")
 
 
