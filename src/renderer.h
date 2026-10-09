@@ -44,6 +44,7 @@ struct RenderView {
     float time = 0;
     bool lightsOn = true;
     bool highBeam = false;
+    float vhs = 1.0f;  // tape effect strength, 0 = clean
     V3 headlightPos[2];
     V3 beamDir{0, 0, 1};
     Environment env = environmentAt(23.0f);

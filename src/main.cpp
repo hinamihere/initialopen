@@ -7,7 +7,6 @@
 #include <chrono>
 #include <cmath>
 #include <cstdio>
-#include <ctime>
 #include <filesystem>
 #include <string>
 #include <vector>
@@ -28,6 +27,7 @@ struct Options {
     bool autodrive = false;  // follow the AI line (testing / future AI opponents)
     bool telemetry = false;  // print body motion every 0.1 s (suspension tuning)
     bool chase = false;
+    bool clean = false;  // start without the tape effect
     float timeOfDay = 23.0f;  // hours
 };
 
@@ -102,10 +102,11 @@ int main(int argc, char** argv) {
         else if (a == "--frames") opt.frames = std::max(1, std::atoi(next().c_str()));
         else if (a == "--autodrive") opt.autodrive = true;
         else if (a == "--chase") opt.chase = true;
+        else if (a == "--clean") opt.clean = true;
         else if (a == "--telemetry") opt.telemetry = true;
         else if (a == "--time") opt.timeOfDay = float(std::atof(next().c_str()));
         else {
-            std::printf("usage: initialopen [--track DIR] [--car DIR] [--spawn AC_NODE] [--time HOURS] [--chase] [--autodrive] [--screenshot FILE.bmp [--frames N]]\n");
+            std::printf("usage: initialopen [--track DIR] [--car DIR] [--spawn AC_NODE] [--time HOURS] [--chase] [--clean] [--autodrive] [--screenshot FILE.bmp [--frames N]]\n");
             return a == "--help" ? 0 : 1;
         }
     }
@@ -245,8 +246,13 @@ int main(int argc, char** argv) {
     const double step = 1.0 / 120.0;
     float camShake = 0;
     // Driver's head: lags behind the shell under g-forces (sense of weight).
-    V3 headOffset{}, prevVel{};
+    V3 headOffset{}, prevVel{}, localAcc{};
     float lookYaw = 0;
+    // Chase camera: car-relative offset on a spring, yaw that trails the car.
+    V3 chaseOffset{}, chaseOffsetVel{};
+    float chaseYaw = std::atan2(spawnFwd.x, spawnFwd.z), chaseFov = 52.0f, chaseRoll = 0;
+    bool chaseInit = false;
+    bool vhsOn = !opt.clean;
     int frame = 0, aiHint = -1;
     SDL_Gamepad* pad = nullptr;
     auto last = std::chrono::steady_clock::now();
@@ -300,6 +306,7 @@ int main(int argc, char** argv) {
                         case SDLK_P: resetToSpawn = true; break;
                         case SDLK_F1: help = !help; break;
                         case SDLK_F2: showSlider = !showSlider; break;
+                        case SDLK_V: vhsOn = !vhsOn; break;
                         default: break;
                     }
                     break;
@@ -324,7 +331,7 @@ int main(int argc, char** argv) {
         float brkT = float(keys[SDL_SCANCODE_S] || keys[SDL_SCANCODE_DOWN]);
         float hbT = float(keys[SDL_SCANCODE_SPACE]);
         bool highBeam = keys[SDL_SCANCODE_L];
-        steerSmooth = approach(steerSmooth, steerT, steerT == 0 ? 6.0f : 3.0f, dt);
+        steerSmooth = approach(steerSmooth, steerT, steerT == 0 ? 4.5f : 2.2f, dt);
         throttleSmooth = approach(throttleSmooth, thrT, 4.0f, dt);
         brakeSmooth = approach(brakeSmooth, brkT, 5.0f, dt);
         input.steer = steerSmooth;
@@ -333,7 +340,8 @@ int main(int argc, char** argv) {
         input.handbrake = hbT;
         if (pad) {
             float sx = SDL_GetGamepadAxis(pad, SDL_GAMEPAD_AXIS_LEFTX) / 32767.0f;
-            if (std::fabs(sx) > 0.08f) input.steer = std::clamp(sx, -1.0f, 1.0f);
+            // Response curve: fine control around center, full lock still at the stop.
+            if (std::fabs(sx) > 0.08f) input.steer = std::copysign(std::pow(std::min((std::fabs(sx) - 0.08f) / 0.92f, 1.0f), 1.6f), sx);
             float rt = SDL_GetGamepadAxis(pad, SDL_GAMEPAD_AXIS_RIGHT_TRIGGER) / 32767.0f;
             float lt = SDL_GetGamepadAxis(pad, SDL_GAMEPAD_AXIS_LEFT_TRIGGER) / 32767.0f;
             input.throttle = std::max(input.throttle, rt);
@@ -391,6 +399,13 @@ int main(int argc, char** argv) {
                         car.suspension[3]);
         }
 
+        // Body-space acceleration (+X = left), updated whenever physics stepped.
+        if (steps > 0) {
+            V3 accel = (car.vel - prevVel) * (1.0f / float(steps * step));
+            V3 a{-dot(accel, car.right), dot(accel, car.up), dot(accel, car.fwd)};
+            localAcc = localAcc + (a - localAcc) * 0.25f;
+        }
+
         // --- Camera.
         int fbW = 0, fbH = 0;
         SDL_GetWindowSizeInPixels(window, &fbW, &fbH);
@@ -406,8 +421,6 @@ int main(int argc, char** argv) {
             // forward, corners push you outward), then a soft spring brings it back.
             if (steps > 0) {
                 float pdt = float(steps * step);
-                V3 accel = (car.vel - prevVel) * (1.0f / pdt);
-                V3 localAcc{-dot(accel, car.right), dot(accel, car.up), dot(accel, car.fwd)};  // body space, +X = left
                 V3 headTarget{clampf(-localAcc.x * 0.006f, -0.07f, 0.07f), clampf(-localAcc.y * 0.002f, -0.03f, 0.03f),
                               clampf(-localAcc.z * 0.005f, -0.06f, 0.06f)};
                 headOffset = headOffset + (headTarget - headOffset) * std::min(1.0f, pdt * 6.0f);
@@ -423,14 +436,51 @@ int main(int argc, char** argv) {
             rv.proj = perspective(56.0f * 3.14159f / 180.0f, 4.0f / 3.0f, 0.05f, 2000.0f);
             rv.camPos = eye;
         } else {
-            V3 flatFwd = normalize(V3{car.fwd.x, 0, car.fwd.z});
-            V3 eye = car.pos - flatFwd * 6.0f + V3{0, 2.0f, 0} + jitter * 4.0f;
-            rv.view = lookAt(eye, car.pos + V3{0, 0.6f, 0}, {0, 1, 0});
-            rv.proj = perspective(50.0f * 3.14159f / 180.0f, 4.0f / 3.0f, 0.1f, 2000.0f);
+            // Heading the camera wants: the car's nose, swung toward the direction of
+            // travel as speed builds, so drifts show the car sideways.
+            V3 flatVel{car.vel.x, 0, car.vel.z};
+            float spd = length(flatVel);
+            float carYaw = std::atan2(car.fwd.x, car.fwd.z);
+            float velYaw = spd > 1.0f ? std::atan2(flatVel.x, flatVel.z) : carYaw;
+            float slide = std::remainder(velYaw - carYaw, 6.2831853f);
+            if (dot(flatVel, car.fwd) < 0) slide = 0;  // reversing: stay behind the car
+            float targetYaw = carYaw + slide * 0.55f * clampf(spd / 12.0f, 0.0f, 1.0f);
+            float camDt = std::min(dt, 0.05f);
+            if (!chaseInit) chaseYaw = targetYaw;
+            chaseYaw += std::remainder(targetYaw - chaseYaw, 6.2831853f) * std::min(1.0f, camDt * 3.5f);
+            V3 dir{std::sin(chaseYaw), 0, std::cos(chaseYaw)};
+
+            // Offset springs: speed stretches the distance, throttle pulls the car away,
+            // braking lets it come closer, cornering swings the camera outward.
+            V3 sideL{dir.z, 0, -dir.x};  // left of the camera heading
+            float dist = 5.6f + spd * 0.035f - clampf(localAcc.z, -12.0f, 12.0f) * 0.07f;
+            float height = 1.9f - clampf(spd * 0.006f, 0.0f, 0.35f);
+            V3 want = dir * -dist + V3{0, height, 0} + sideL * clampf(-localAcc.x * 0.05f, -0.8f, 0.8f);
+            if (!chaseInit) {
+                chaseOffset = want;
+                chaseInit = true;
+            }
+            const float k = 7.0f;  // spring rate (1/s), critically damped
+            chaseOffsetVel = chaseOffsetVel + ((want - chaseOffset) * (k * k) - chaseOffsetVel * (2.0f * k)) * camDt;
+            chaseOffset = chaseOffset + chaseOffsetVel * camDt;
+            V3 eye = car.pos + chaseOffset + jitter * 3.0f;
+            // Never dig into the hillside.
+            float ground = physics.groundBelow(eye + V3{0, 3.0f, 0}, 8.0f);
+            if (!std::isnan(ground)) eye.y = std::max(eye.y, ground + 0.6f);
+
+            V3 target = car.pos + V3{0, 0.75f, 0} + flatVel * 0.12f;
+            chaseRoll += (clampf(localAcc.x * 0.006f, -0.06f, 0.06f) - chaseRoll) * std::min(1.0f, camDt * 3.0f);
+            V3 fwdView = normalize(target - eye);
+            V3 rightView = normalize(cross(fwdView, V3{0, 1, 0}));
+            V3 upView = normalize(V3{0, 1, 0} * std::cos(chaseRoll) + rightView * std::sin(chaseRoll));
+            chaseFov += (clampf(52.0f + spd * 0.22f, 52.0f, 66.0f) - chaseFov) * std::min(1.0f, camDt * 2.0f);
+            rv.view = lookAt(eye, target, upView);
+            rv.proj = perspective(chaseFov * 3.14159f / 180.0f, 4.0f / 3.0f, 0.1f, 2000.0f);
             rv.camPos = eye;
         }
         prevVel = car.vel;
         rv.lightsOn = lightsOn;
+        rv.vhs = vhsOn ? 1.0f : 0.0f;
         rv.env = environmentAt(timeOfDay);
         rv.highBeam = highBeam;
         float hx = carSpec.hullMax.x * 0.65f, hy = carSpec.hullMin.y + 0.45f, hz = carSpec.hullMax.z - 0.25f;
@@ -458,23 +508,8 @@ int main(int argc, char** argv) {
         // --- Camcorder OSD and gauges.
         Osd& osd = renderer.osd();
         osd.clear();
-        std::time_t now_c = std::time(nullptr);
-        std::tm lt = *std::localtime(&now_c);
-        // The camcorder clock shows game time: today's date, the slider's time of day.
-        int clockSec = int(timeOfDay * 3600.0f + float(std::fmod(simTime, 60.0))) % 86400;
-        lt.tm_hour = clockSec / 3600;
-        lt.tm_min = clockSec / 60 % 60;
-        lt.tm_sec = clockSec % 60;
-        static const char* months[] = {"JAN", "FEB", "MAR", "APR", "MAY", "JUN", "JUL", "AUG", "SEP", "OCT", "NOV", "DEC"};
         char buf[96];
         uint32_t white = rgba(235, 235, 235);
-        if (int(simTime * 2) % 2 == 0) osd.text(28, 26, "*", rgba(255, 40, 30));
-        osd.text(44, 26, "REC", white);
-        osd.text(560, 26, "SP", white);
-        std::snprintf(buf, sizeof buf, "%s.%2d 1998", months[lt.tm_mon], lt.tm_mday);
-        osd.text(404, 420, buf, white);
-        std::snprintf(buf, sizeof buf, "%s %2d:%02d:%02d", lt.tm_hour >= 12 ? "PM" : "AM", (lt.tm_hour + 11) % 12 + 1, lt.tm_min, lt.tm_sec);
-        osd.text(404, 442, buf, white);
         float kmh = std::fabs(car.speed) * 3.6f;
         osd.gauge(70, 400, 46, car.rpm / 10000.0f, car.maxRpm / 10000.0f, 10, "RPM X1000");
         osd.gauge(170, 400, 46, kmh / 300.0f, 2.0f, 6, "KM/H");
@@ -498,7 +533,7 @@ int main(int argc, char** argv) {
             osd.text(28, 72, carSpec.name, white, 1.0f);
             osd.text(28, 92, "WASD DRIVE  SPACE HANDBRAKE  L HIGH BEAM  H LIGHTS", white, 1.0f);
             osd.text(28, 104, "C CAMERA  T AT/MT  Q/E SHIFT  R RESET TO ROAD  P PIT  F1 HELP", white, 1.0f);
-            osd.text(28, 116, "DRAG SLIDER OR HOLD [ ] TO CHANGE TIME  F2 HIDE SLIDER", white, 1.0f);
+            osd.text(28, 116, "DRAG SLIDER OR HOLD [ ] TO CHANGE TIME  F2 HIDE SLIDER  V TAPE EFFECT", white, 1.0f);
         }
 
         renderer.render(rv, fbW, fbH);

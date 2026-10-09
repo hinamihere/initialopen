@@ -69,7 +69,7 @@ The console then prints which bank events were found and their parameters.
 ```
 
 The game picks the first track and car found under `assets/`. Useful flags:
-`--track DIR`, `--car DIR`, `--spawn AC_HOTLAP_START_0`, `--time 17.8`, `--chase`,
+`--track DIR`, `--car DIR`, `--spawn AC_HOTLAP_START_0`, `--time 17.8`, `--chase`, `--clean` (no tape effect),
 `--autodrive`, and `--screenshot out.bmp --frames N` for headless checks.
 
 | Keys | Gamepad | Action |
@@ -83,4 +83,5 @@ The game picks the first track and car found under `assets/`. Useful flags:
 | T, Q / E | LB / RB | toggle AT/MT, shift down / up |
 | R / P | Back | reset to road / back to spawn |
 | drag slider, hold `[` `]` | | time of day |
+| V | | tape effect on/off |
 | F1 / F2 | | help / time slider |

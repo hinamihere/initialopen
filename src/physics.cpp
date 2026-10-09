@@ -323,7 +323,7 @@ void Physics::step(float dt, CarInput& in) {
     // Steering: the player's input maps directly to wheel angle, with only mild lock
     // reduction at speed. A small counter-steer nudge kicks in only in real slides
     // (beyond ~6 degrees of body slip) to help keyboard players catch them.
-    float lock = I.maxSteer * (1.0f - 0.35f * std::clamp(speed / 45.0f, 0.0f, 1.0f));
+    float lock = I.maxSteer * (1.0f - 0.45f * std::clamp(speed / 40.0f, 0.0f, 1.0f));
     float desired = in.steer * lock;
     if (speed > 5.0f && vFwd > 0) {
         float beta = std::atan2(vRight, std::max(vFwd, 0.1f));

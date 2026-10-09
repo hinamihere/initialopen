@@ -270,15 +270,13 @@ void main() {
     vec2 px = 1.0 / vec2(640.0, 480.0);
     float line = floor(uv.y * 480.0);
 
-    // Time-base wobble: per-line jitter, head-switching noise at the bottom,
-    // and a tracking band that drifts up the frame now and then.
-    float wob = (hash(vec2(line, floor(t * 30.0))) - 0.5) * 0.7 * px.x;
-    float bottom = smoothstep(0.03, 0.0, uv.y);
-    wob += (sin(uv.y * 300.0 + t * 17.0) * 4.0 + hash(vec2(line, t)) * 6.0) * px.x * bottom;
-    float bandY = 1.25 - fract(t * 0.031) * 1.5;
-    float band = exp(-pow((uv.y - bandY) * 45.0, 2.0));
-    wob += band * (hash(vec2(line, t * 3.0)) - 0.5) * 12.0 * px.x;
-    vec2 u = uv + vec2(wob, 0.0);
+    float vhs = post_fs[0].y;  // 0 = clean picture, 1 = tape look
+    // Time-base wobble: faint per-line jitter plus head-switching noise confined to
+    // the bottom edge (no rolling bands or dropouts across the picture).
+    float wob = (hash(vec2(line, floor(t * 30.0))) - 0.5) * 0.35 * px.x;
+    float bottom = smoothstep(0.02, 0.0, uv.y);
+    wob += (sin(uv.y * 300.0 + t * 17.0) * 3.0 + hash(vec2(line, t)) * 4.0) * px.x * bottom;
+    vec2 u = uv + vec2(wob * vhs, 0.0);
 
     // Luma is only slightly soft; chroma is smeared wide and shifted right.
     float Y = 0.0;
@@ -312,14 +310,15 @@ void main() {
     col += grain * mix(0.09, 0.03, clamp(lum * 2.0, 0.0, 1.0));
     vec2 cn = vec2(hash(floor(uv * vec2(160.0, 240.0)) + t), hash(floor(uv * vec2(160.0, 240.0)) - t)) - 0.5;
     col += toRGB(vec3(0.0, cn * 0.03));
-    float drop = step(0.9993, hash(vec2(floor(t * 30.0), line)));
-    col = mix(col, vec3(0.85), drop * step(hash(vec2(line, uv.x * 20.0 + t)), 0.6));
-    col += band * 0.06 * hash(uv * 400.0 + t);
 
-    col *= 0.95 + 0.05 * sin(uv.y * 480.0 * 3.14159);
+    col *= 0.96 + 0.04 * sin(uv.y * 480.0 * 3.14159);
+    col = col * 0.94 + vec3(0.015, 0.018, 0.022);  // lifted, slightly green-blue blacks
+
+    // Clean path: the plain picture with the same bloom.
+    vec3 clean = texture(tex, uv).rgb + bloom * 0.07;
+    col = mix(clean, col, vhs);
     vec2 v = uv - 0.5;
-    col *= 1.0 - dot(v, v) * 0.7;
-    col = col * 0.93 + vec3(0.018, 0.022, 0.026);  // lifted, slightly green-blue blacks
+    col *= 1.0 - dot(v, v) * mix(0.35, 0.7, vhs);
     frag_color = vec4(clamp(col, 0.0, 1.0), 1.0);
 }
 )";
@@ -352,6 +351,8 @@ const Glyph kFont[] = {
     {'Y', {0x11, 0x11, 0x11, 0x0A, 0x04, 0x04, 0x04}}, {'Z', {0x1F, 0x01, 0x02, 0x04, 0x08, 0x10, 0x1F}},
     {':', {0x00, 0x0C, 0x0C, 0x00, 0x0C, 0x0C, 0x00}}, {'.', {0x00, 0x00, 0x00, 0x00, 0x00, 0x0C, 0x0C}},
     {'/', {0x00, 0x01, 0x02, 0x04, 0x08, 0x10, 0x00}}, {'-', {0x00, 0x00, 0x00, 0x1F, 0x00, 0x00, 0x00}},
+    {'[', {0x0E, 0x08, 0x08, 0x08, 0x08, 0x08, 0x0E}}, {']', {0x0E, 0x02, 0x02, 0x02, 0x02, 0x02, 0x0E}},
+    {'(', {0x02, 0x04, 0x08, 0x08, 0x08, 0x04, 0x02}}, {')', {0x08, 0x04, 0x02, 0x02, 0x02, 0x04, 0x08}},
     {'*', {0x00, 0x0E, 0x1F, 0x1F, 0x1F, 0x0E, 0x00}},  // record dot
     {'>', {0x10, 0x18, 0x1C, 0x1E, 0x1C, 0x18, 0x10}},  // play triangle
 };
@@ -861,7 +862,7 @@ void Renderer::render(const RenderView& rv, int fbW, int fbH) {
     sg_apply_pipeline(g.postPip);
     float aspect = float(fbW) / float(std::max(fbH, 1)), target = 4.0f / 3.0f;
     float pvs[4] = {aspect > target ? target / aspect : 1.0f, aspect > target ? 1.0f : aspect / target, 0, 0};
-    float pfs[4] = {rv.time, 0, 0, 0};
+    float pfs[4] = {rv.time, rv.vhs, 0, 0};
     sg_apply_uniforms(0, {pvs, sizeof(pvs)});
     sg_apply_uniforms(1, {pfs, sizeof(pfs)});
     sg_bindings b = {};
