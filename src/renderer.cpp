@@ -218,6 +218,7 @@ void main() {
 )";
 
 const char* kOsdVS = R"(#version 410
+uniform vec4 osd_vs[1];
 layout(location=0) in vec2 pos;
 layout(location=1) in vec2 uv0;
 layout(location=2) in vec4 col0;
@@ -226,7 +227,7 @@ out vec4 col;
 void main() {
     uv = uv0;
     col = col0;
-    gl_Position = vec4(pos.x / 320.0 - 1.0, 1.0 - pos.y / 240.0, 0.0, 1.0);
+    gl_Position = vec4((pos.x / 320.0 - 1.0) * osd_vs[0].x, (1.0 - pos.y / 240.0) * osd_vs[0].y, 0.0, 1.0);
 }
 )";
 
@@ -306,7 +307,7 @@ void main() {
 
     // Grain (stronger in the dark, where AGC pumps the gain) and dropouts.
     float lum = dot(col, vec3(0.3, 0.59, 0.11));
-    float grain = hash(floor(uv * vec2(640.0, 480.0)) + fract(t * 7.13) * 91.0) - 0.5;
+    float grain = hash(floor(uv * post_fs[0].zw * 0.5) + fract(t * 7.13) * 91.0) - 0.5;
     col += grain * mix(0.09, 0.03, clamp(lum * 2.0, 0.0, 1.0));
     vec2 cn = vec2(hash(floor(uv * vec2(160.0, 240.0)) + t), hash(floor(uv * vec2(160.0, 240.0)) - t)) - 0.5;
     col += toRGB(vec3(0.0, cn * 0.03));
@@ -411,8 +412,52 @@ sg_buffer makeBuffer(const void* data, size_t size, bool index, const char* labe
 struct Renderer::Gpu {
     sg_shader sceneShd{}, osdShd{}, postShd{}, skyShd{};
     sg_pipeline scenePip[3]{}, osdPip{}, postPip{}, skyPip{};
-    sg_image colorImg{}, depthImg{}, fontImg{}, whiteImg{};
-    sg_view colorAtt{}, depthAtt{}, colorTex{}, fontTex{}, whiteTex{};
+    // Scene target: MSAA color + depth, resolved into a texture for the post pass.
+    static constexpr int kMsaa = 4;
+    int targetW = 0, targetH = 0;
+    sg_image msaaImg{}, resolveImg{}, depthImg{}, fontImg{}, whiteImg{};
+    sg_view colorAtt{}, resolveAtt{}, depthAtt{}, colorTex{}, fontTex{}, whiteTex{};
+
+    void ensureTarget(int w, int h) {
+        if (w == targetW && h == targetH) return;
+        for (sg_view v : {colorAtt, resolveAtt, depthAtt, colorTex})
+            if (v.id) sg_destroy_view(v);
+        for (sg_image i : {msaaImg, resolveImg, depthImg})
+            if (i.id) sg_destroy_image(i);
+        targetW = w;
+        targetH = h;
+        sg_image_desc d = {};
+        d.width = w;
+        d.height = h;
+        d.pixel_format = SG_PIXELFORMAT_RGBA8;
+        d.sample_count = kMsaa;
+        d.usage.color_attachment = true;
+        d.label = "scene-msaa";
+        msaaImg = sg_make_image(&d);
+        d.sample_count = 1;
+        d.usage = {};
+        d.usage.resolve_attachment = true;
+        d.label = "scene-resolve";
+        resolveImg = sg_make_image(&d);
+        d.sample_count = kMsaa;
+        d.usage = {};
+        d.usage.depth_stencil_attachment = true;
+        d.pixel_format = SG_PIXELFORMAT_DEPTH_STENCIL;
+        d.label = "scene-depth";
+        depthImg = sg_make_image(&d);
+        sg_view_desc v = {};
+        v.color_attachment.image = msaaImg;
+        colorAtt = sg_make_view(&v);
+        v = {};
+        v.resolve_attachment.image = resolveImg;
+        resolveAtt = sg_make_view(&v);
+        v = {};
+        v.depth_stencil_attachment.image = depthImg;
+        depthAtt = sg_make_view(&v);
+        v = {};
+        v.texture.image = resolveImg;
+        colorTex = sg_make_view(&v);
+    }
     sg_sampler linearSmp{}, nearestSmp{}, materialSmp{};
     sg_buffer osdBuf{};
     std::vector<std::unique_ptr<GpuModel>> models;
@@ -489,6 +534,7 @@ bool Renderer::init() {
                 pd.colors[0].blend.src_factor_rgb = SG_BLENDFACTOR_SRC_ALPHA;
                 pd.colors[0].blend.dst_factor_rgb = SG_BLENDFACTOR_ONE_MINUS_SRC_ALPHA;
             }
+            pd.sample_count = Gpu::kMsaa;
             pd.label = "scene-pipeline";
             g.scenePip[pass] = sg_make_pipeline(&pd);
         }
@@ -509,6 +555,7 @@ bool Renderer::init() {
         pd.shader = g.skyShd;
         pd.depth.compare = SG_COMPAREFUNC_ALWAYS;
         pd.depth.write_enabled = false;
+        pd.sample_count = Gpu::kMsaa;
         pd.label = "sky-pipeline";
         g.skyPip = sg_make_pipeline(&pd);
     }
@@ -518,6 +565,10 @@ bool Renderer::init() {
         sg_shader_desc sd = {};
         sd.vertex_func.source = kOsdVS;
         sd.fragment_func.source = kOsdFS;
+        sd.uniform_blocks[0].stage = SG_SHADERSTAGE_VERTEX;
+        sd.uniform_blocks[0].size = 16;
+        sd.uniform_blocks[0].layout = SG_UNIFORMLAYOUT_STD140;
+        sd.uniform_blocks[0].glsl_uniforms[0] = {SG_UNIFORMTYPE_FLOAT4, 1, "osd_vs"};
         const char* names[3] = {"pos", "uv0", "col0"};
         for (int k = 0; k < 3; ++k) {
             sd.attrs[k].glsl_name = names[k];
@@ -542,6 +593,7 @@ bool Renderer::init() {
         pd.colors[0].blend.dst_factor_rgb = SG_BLENDFACTOR_ONE_MINUS_SRC_ALPHA;
         pd.depth.compare = SG_COMPAREFUNC_ALWAYS;
         pd.depth.write_enabled = false;
+        pd.sample_count = Gpu::kMsaa;
         pd.label = "osd-pipeline";
         g.osdPip = sg_make_pipeline(&pd);
 
@@ -579,33 +631,6 @@ bool Renderer::init() {
         pd.shader = g.postShd;
         pd.label = "post-pipeline";
         g.postPip = sg_make_pipeline(&pd);
-    }
-
-    // Offscreen render target.
-    {
-        sg_image_desc cd = {};
-        cd.usage.color_attachment = true;
-        cd.width = kInternalW;
-        cd.height = kInternalH;
-        cd.pixel_format = SG_PIXELFORMAT_RGBA8;
-        cd.label = "scene-color";
-        g.colorImg = sg_make_image(&cd);
-        sg_image_desc dd = cd;
-        dd.usage = {};
-        dd.usage.depth_stencil_attachment = true;
-        dd.pixel_format = SG_PIXELFORMAT_DEPTH_STENCIL;
-        dd.label = "scene-depth";
-        g.depthImg = sg_make_image(&dd);
-
-        sg_view_desc v = {};
-        v.color_attachment.image = g.colorImg;
-        g.colorAtt = sg_make_view(&v);
-        v = {};
-        v.depth_stencil_attachment.image = g.depthImg;
-        g.depthAtt = sg_make_view(&v);
-        v = {};
-        v.texture.image = g.colorImg;
-        g.colorTex = sg_make_view(&v);
     }
 
     // Font atlas and a 1x1 white texture for untextured materials.
@@ -800,11 +825,16 @@ void Renderer::render(const RenderView& rv, int fbW, int fbH) {
         return a.mat->pass == 2 ? a.depth > b.depth : false;
     });
 
-    // --- Scene pass into the low-res target.
+    // --- Scene pass, multisampled, at the chosen fraction of window resolution.
+    int tw = std::max(320, int(float(fbW) * rv.renderScale + 0.5f));
+    int th = std::max(240, int(float(fbH) * rv.renderScale + 0.5f));
+    g.ensureTarget(tw, th);
     sg_pass pass = {};
     pass.action.colors[0].load_action = SG_LOADACTION_CLEAR;
     pass.action.colors[0].clear_value = {0.010f, 0.012f, 0.018f, 1.0f};
+    pass.action.colors[0].store_action = SG_STOREACTION_DONTCARE;
     pass.attachments.colors[0] = g.colorAtt;
+    pass.attachments.resolves[0] = g.resolveAtt;
     pass.attachments.depth_stencil = g.depthAtt;
     sg_begin_pass(&pass);
     sg_apply_pipeline(g.skyPip);
@@ -839,6 +869,9 @@ void Renderer::render(const RenderView& rv, int fbW, int fbH) {
 
     if (osdCount > 0) {
         sg_apply_pipeline(g.osdPip);
+        float aspect = float(tw) / float(th), target = kOsdW / kOsdH;
+        float ovs[4] = {aspect > target ? target / aspect : 1.0f, aspect > target ? 1.0f : aspect / target, 0, 0};
+        sg_apply_uniforms(0, {ovs, sizeof(ovs)});
         sg_bindings b = {};
         b.vertex_buffers[0] = g.osdBuf;
         b.views[0] = g.fontTex;
@@ -848,7 +881,7 @@ void Renderer::render(const RenderView& rv, int fbW, int fbH) {
     }
     sg_end_pass();
 
-    // --- Post pass to the window, letterboxed to 4:3.
+    // --- Post pass to the window.
     sg_pass post = {};
     post.action.colors[0].load_action = SG_LOADACTION_CLEAR;
     post.action.colors[0].clear_value = {0, 0, 0, 1};
@@ -860,9 +893,8 @@ void Renderer::render(const RenderView& rv, int fbW, int fbH) {
     post.swapchain.gl.framebuffer = 0;
     sg_begin_pass(&post);
     sg_apply_pipeline(g.postPip);
-    float aspect = float(fbW) / float(std::max(fbH, 1)), target = 4.0f / 3.0f;
-    float pvs[4] = {aspect > target ? target / aspect : 1.0f, aspect > target ? 1.0f : aspect / target, 0, 0};
-    float pfs[4] = {rv.time, rv.vhs, 0, 0};
+    float pvs[4] = {1.0f, 1.0f, 0, 0};
+    float pfs[4] = {rv.time, rv.vhs, float(tw), float(th)};
     sg_apply_uniforms(0, {pvs, sizeof(pvs)});
     sg_apply_uniforms(1, {pfs, sizeof(pfs)});
     sg_bindings b = {};

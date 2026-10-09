@@ -84,4 +84,5 @@ The game picks the first track and car found under `assets/`. Useful flags:
 | R / P | Back | reset to road / back to spawn |
 | drag slider, hold `[` `]` | | time of day |
 | V | | tape effect on/off |
+| F3 | | resolution: native / half / 480p |
 | F1 / F2 | | help / time slider |

@@ -1,4 +1,5 @@
-// sokol_gfx renderer: low-res night scene -> OSD overlay -> analog camcorder post pass.
+// sokol_gfx renderer: MSAA scene at (a fraction of) window resolution -> OSD overlay
+// -> post pass (optional analog tape look).
 #pragma once
 #include <cstdint>
 #include <memory>
@@ -8,16 +9,16 @@
 #include "sky.h"
 #include "vmath.h"
 
-// Internal framebuffer: 4:3 standard definition, like a 90s Hi8 camcorder.
-constexpr int kInternalW = 640;
-constexpr int kInternalH = 480;
+// The OSD is laid out in a virtual 640x480 space, centered on screen at 4:3.
+constexpr float kOsdW = 640.0f;
+constexpr float kOsdH = 480.0f;
 
 inline uint32_t rgba(int r, int g, int b, int a = 255) {
     return uint32_t(r) | (uint32_t(g) << 8) | (uint32_t(b) << 16) | (uint32_t(a) << 24);
 }
 
-// 2D overlay in internal-framebuffer pixels (origin top-left). It is drawn
-// before the tape effect, so it degrades along with the picture.
+// 2D overlay in virtual OSD pixels (origin top-left). It is drawn before the
+// post pass, so it degrades along with the picture when the tape look is on.
 class Osd {
 public:
     struct Vert {
@@ -45,6 +46,7 @@ struct RenderView {
     bool lightsOn = true;
     bool highBeam = false;
     float vhs = 1.0f;  // tape effect strength, 0 = clean
+    float renderScale = 1.0f;  // scene resolution as a fraction of the window
     V3 headlightPos[2];
     V3 beamDir{0, 0, 1};
     Environment env = environmentAt(23.0f);

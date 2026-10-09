@@ -253,6 +253,9 @@ int main(int argc, char** argv) {
     float chaseYaw = std::atan2(spawnFwd.x, spawnFwd.z), chaseFov = 52.0f, chaseRoll = 0;
     bool chaseInit = false;
     bool vhsOn = !opt.clean;
+    // Scene resolution: native, half, or a retro 480 lines.
+    int resMode = 0;
+    const char* resNames[] = {"NATIVE", "HALF", "480P"};
     int frame = 0, aiHint = -1;
     SDL_Gamepad* pad = nullptr;
     auto last = std::chrono::steady_clock::now();
@@ -307,6 +310,7 @@ int main(int argc, char** argv) {
                         case SDLK_F1: help = !help; break;
                         case SDLK_F2: showSlider = !showSlider; break;
                         case SDLK_V: vhsOn = !vhsOn; break;
+                        case SDLK_F3: resMode = (resMode + 1) % 3; break;
                         default: break;
                     }
                     break;
@@ -433,7 +437,7 @@ int main(int argc, char** argv) {
             float pitch = carSpec.onboardPitchDeg * 3.14159f / 180.0f;
             V3 look = normalize(B.transformDir({std::sin(lookYaw), std::sin(pitch), std::cos(lookYaw) * std::cos(pitch)}));
             rv.view = lookAt(eye, eye + look, B.transformDir({0, 1, 0}));
-            rv.proj = perspective(56.0f * 3.14159f / 180.0f, 4.0f / 3.0f, 0.05f, 2000.0f);
+            rv.proj = perspective(56.0f * 3.14159f / 180.0f, float(fbW) / float(std::max(fbH, 1)), 0.05f, 2000.0f);
             rv.camPos = eye;
         } else {
             // Heading the camera wants: the car's nose, swung toward the direction of
@@ -475,12 +479,13 @@ int main(int argc, char** argv) {
             V3 upView = normalize(V3{0, 1, 0} * std::cos(chaseRoll) + rightView * std::sin(chaseRoll));
             chaseFov += (clampf(52.0f + spd * 0.22f, 52.0f, 66.0f) - chaseFov) * std::min(1.0f, camDt * 2.0f);
             rv.view = lookAt(eye, target, upView);
-            rv.proj = perspective(chaseFov * 3.14159f / 180.0f, 4.0f / 3.0f, 0.1f, 2000.0f);
+            rv.proj = perspective(chaseFov * 3.14159f / 180.0f, float(fbW) / float(std::max(fbH, 1)), 0.1f, 2000.0f);
             rv.camPos = eye;
         }
         prevVel = car.vel;
         rv.lightsOn = lightsOn;
         rv.vhs = vhsOn ? 1.0f : 0.0f;
+        rv.renderScale = resMode == 0 ? 1.0f : (resMode == 1 ? 0.5f : 480.0f / float(std::max(fbH, 1)));
         rv.env = environmentAt(timeOfDay);
         rv.highBeam = highBeam;
         float hx = carSpec.hullMax.x * 0.65f, hy = carSpec.hullMin.y + 0.45f, hz = carSpec.hullMax.z - 0.25f;
@@ -534,6 +539,8 @@ int main(int argc, char** argv) {
             osd.text(28, 92, "WASD DRIVE  SPACE HANDBRAKE  L HIGH BEAM  H LIGHTS", white, 1.0f);
             osd.text(28, 104, "C CAMERA  T AT/MT  Q/E SHIFT  R RESET TO ROAD  P PIT  F1 HELP", white, 1.0f);
             osd.text(28, 116, "DRAG SLIDER OR HOLD [ ] TO CHANGE TIME  F2 HIDE SLIDER  V TAPE EFFECT", white, 1.0f);
+            std::snprintf(buf, sizeof buf, "F3 RESOLUTION: %s", resNames[resMode]);
+            osd.text(28, 128, buf, white, 1.0f);
         }
 
         renderer.render(rv, fbW, fbH);
