@@ -1,0 +1,9 @@
+# Build output
+/build/
+
+# Third-party game content: never commit it. Mods stay on the player's machine.
+/mods_raw/
+/assets/
+
+__pycache__/
+*.pyc
