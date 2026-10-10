@@ -61,8 +61,9 @@ public:
     // Uploads a model to the GPU; returns its handle. CPU image data can be freed afterwards.
     int addModel(const ModelData& model);
     void setLights(const std::vector<TrackLight>* lights) { trackLights = lights; }
-    // Queue one mesh group of a model for this frame.
-    void submit(int model, int group, const M4& xf, float emissiveScale = 1.0f);
+    // Queue one mesh group of a model for this frame. alpha < 1 draws it see-through
+    // (ghost cars): blended, no shadows.
+    void submit(int model, int group, const M4& xf, float emissiveScale = 1.0f, float alpha = 1.0f);
     Osd& osd() { return osdLayer; }
     void render(const RenderView& rv, int fbWidth, int fbHeight);
 

@@ -7,6 +7,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdio>
+#include <cstring>
 #include <filesystem>
 #include <string>
 #include <vector>
@@ -15,6 +16,7 @@
 #include "audio.h"
 #include "physics.h"
 #include "renderer.h"
+#include "timing.h"
 
 namespace fs = std::filesystem;
 
@@ -25,7 +27,8 @@ struct Options {
     std::string screenshot;  // render, save a BMP after `frames` frames, then quit
     int frames = 240;
     bool autodrive = false;  // follow the AI line (testing / future AI opponents)
-    bool telemetry = false;  // print body motion every 0.1 s (suspension tuning)
+    bool telemetry = false;
+    float autodriveSpeed = 16.0f;  // m/s  // print body motion every 0.1 s (suspension tuning)
     bool chase = false;
     bool clean = false;  // start without the tape effect
     float timeOfDay = 23.0f;  // hours
@@ -101,12 +104,13 @@ int main(int argc, char** argv) {
         else if (a == "--screenshot") opt.screenshot = next();
         else if (a == "--frames") opt.frames = std::max(1, std::atoi(next().c_str()));
         else if (a == "--autodrive") opt.autodrive = true;
+        else if (a == "--autodrive-speed") opt.autodriveSpeed = float(std::atof(next().c_str()));
         else if (a == "--chase") opt.chase = true;
         else if (a == "--clean") opt.clean = true;
         else if (a == "--telemetry") opt.telemetry = true;
         else if (a == "--time") opt.timeOfDay = float(std::atof(next().c_str()));
         else {
-            std::printf("usage: initialopen [--track DIR] [--car DIR] [--spawn AC_NODE] [--time HOURS] [--chase] [--clean] [--autodrive] [--screenshot FILE.bmp [--frames N]]\n");
+            std::printf("usage: initialopen [--track DIR] [--car DIR] [--spawn AC_NODE] [--time HOURS] [--chase] [--clean] [--autodrive [--autodrive-speed M/S]] [--screenshot FILE.bmp [--frames N]]\n");
             return a == "--help" ? 0 : 1;
         }
     }
@@ -222,6 +226,33 @@ int main(int argc, char** argv) {
     double loadSec = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
     std::printf("Loaded '%s' + '%s' in %.2fs\n", trackInfo.name.c_str(), carSpec.name.c_str(), loadSec);
 
+    // --- Time attack: progress along the racing line, lap timer, best-lap ghost.
+    auto u8name = [](const std::string& s) {
+        fs::path p(std::u8string(reinterpret_cast<const char8_t*>(s.data()), s.size()));
+        auto u = p.filename().u8string();
+        return std::string(u.begin(), u.end());
+    };
+    auto u8parent = [&](const std::string& s) {
+        fs::path p(std::u8string(reinterpret_cast<const char8_t*>(s.data()), s.size()));
+        auto u = p.parent_path().u8string();
+        return u8name(std::string(u.begin(), u.end()));
+    };
+    const std::string trackKey = u8parent(opt.track) + "/" + u8name(opt.track), carId = u8name(opt.car);
+    const std::string bestPath = "runs/" + trackKey + "/" + carId + ".best";
+    TrackProgress progress;
+    progress.init(trackInfo.aiLine);
+    LapTimer timer;
+    timer.init(progress.length(), progress.closed());
+    Run best, current;
+    bool haveBest = best.load(bestPath);
+    if (haveBest) std::printf("best lap %s loaded from %s\n", formatLapTime(best.time).c_str(), bestPath.c_str());
+    double lastSample = -1;
+    float lastLap = 0, lapProgress = 0;
+    bool lastLapValid = false, haveLastLap = false;
+    std::string banner;
+    double bannerUntil = 0;
+    uint32_t bannerColor = 0;
+
     CarAudio audio;
     bool audioOk = opt.screenshot.empty() && audio.init(opt.car, fs::path(std::u8string(reinterpret_cast<const char8_t*>(opt.car.data()), opt.car.size())).filename().string());
 
@@ -253,6 +284,7 @@ int main(int argc, char** argv) {
     float chaseYaw = std::atan2(spawnFwd.x, spawnFwd.z), chaseFov = 52.0f, chaseRoll = 0;
     bool chaseInit = false;
     bool vhsOn = !opt.clean;
+    bool ghostOn = true;
     // Scene resolution: native, half, or a retro 480 lines.
     int resMode = 0;
     const char* resNames[] = {"NATIVE", "HALF", "480P"};
@@ -311,6 +343,7 @@ int main(int argc, char** argv) {
                         case SDLK_F2: showSlider = !showSlider; break;
                         case SDLK_V: vhsOn = !vhsOn; break;
                         case SDLK_F3: resMode = (resMode + 1) % 3; break;
+                        case SDLK_G: ghostOn = !ghostOn; break;
                         default: break;
                     }
                     break;
@@ -360,7 +393,7 @@ int main(int argc, char** argv) {
             V3 to = normalize(V3{target.x - car.pos.x, 0, target.z - car.pos.z});
             float side = dot(to, car.right), ahead = dot(to, car.fwd);
             input.steer = std::clamp(std::atan2(side, ahead) * 2.5f, -1.0f, 1.0f);
-            float wanted = 16.0f;
+            float wanted = opt.autodriveSpeed;
             input.throttle = car.speed < wanted ? 0.7f : 0.0f;
             input.brake = car.speed > wanted + 4.0f ? 0.4f : 0.0f;
         }
@@ -370,8 +403,12 @@ int main(int argc, char** argv) {
             int k = nearestAi(trackInfo.aiLine, car.pos);
             V3 a = trackInfo.aiLine[k], b = trackInfo.aiLine[(k + 1) % trackInfo.aiLine.size()];
             physics.resetCar(spawnAt(a), normalize(V3{b.x - a.x, 0, b.z - a.z}));
+            timer.invalidate();
         }
-        if (resetToSpawn) physics.resetCar(spawnPos, spawnFwd);
+        if (resetToSpawn) {
+            physics.resetCar(spawnPos, spawnFwd);
+            timer.stop();
+        }
 
         // --- Fixed-step physics.
         accumulator += dt;
@@ -383,6 +420,55 @@ int main(int argc, char** argv) {
             ++steps;
         }
         car = physics.state();
+
+        // --- Lap timing and recording.
+        lapProgress = progress.project(car.pos);
+        LapTimer::Event lapEvent = timer.update(lapProgress, simTime);
+        if (lapEvent == LapTimer::Event::Finished) {
+            current.time = timer.finishedTime();
+            std::copy(timer.finishedSplits(), timer.finishedSplits() + LapTimer::kSectors, current.sectors);
+            lastLap = current.time;
+            lastLapValid = timer.finishedValid();
+            haveLastLap = true;
+            bool improved = lastLapValid && (!haveBest || current.time < best.time);
+            std::printf("lap %s%s%s\n", formatLapTime(current.time).c_str(), lastLapValid ? "" : " (invalid)", improved ? " NEW BEST" : "");
+            if (improved) {
+                current.track = trackKey;
+                current.car = carId;
+                best = current;
+                haveBest = true;
+                if (!best.save(bestPath)) std::printf("could not save %s\n", bestPath.c_str());
+            }
+            banner = (improved ? "NEW BEST " : (lastLapValid ? "LAP " : "INVALID LAP ")) + formatLapTime(current.time);
+            bannerColor = improved ? rgba(90, 255, 140) : (lastLapValid ? rgba(235, 235, 235) : rgba(255, 80, 60));
+            bannerUntil = simTime + 4.0;
+        }
+        if (lapEvent == LapTimer::Event::Started || (lapEvent == LapTimer::Event::Finished && timer.running())) {
+            current.frames.clear();
+            lastSample = -1;
+        }
+        if (timer.running() && (lastSample < 0 || simTime - lastSample >= 1.0 / 30.0)) {
+            lastSample = simTime;
+            RunFrame f;
+            f.t = timer.lapTime(simTime);
+            f.progress = lapProgress;
+            f.pos = car.pos;
+            f.rot = quatFromMat(car.body);
+            M4 inv = rigidInverse(car.body);
+            for (int w = 0; w < 4; ++w) {
+                M4 rel = inv * car.wheels[w];
+                f.wheelPos[w] = {rel.m[12], rel.m[13], rel.m[14]};
+                f.wheelRot[w] = quatFromMat(rel);
+            }
+            f.speed = car.speed;
+            f.rpm = car.rpm;
+            f.steer = input.steer;
+            f.throttle = input.throttle;
+            f.brake = input.brake;
+            f.gear = car.gear;
+            current.frames.push_back(f);
+        }
+
         if (audioOk) {
             CarSound snd;
             snd.rpm = car.rpm;
@@ -510,6 +596,19 @@ int main(int argc, char** argv) {
             }
         }
 
+        // Ghost of the best lap, time-synchronized with the current one.
+        if (ghostOn && haveBest && timer.running() && timer.lapTime(simTime) <= best.time) {
+            RunFrame gf = best.sample(timer.lapTime(simTime));
+            M4 G = matFromQuat(gf.rot, gf.pos);
+            float alpha = 0.38f * smoothstep(2.5f, 9.0f, length(gf.pos - rv.camPos));
+            if (alpha > 0.01f) {
+                renderer.submit(carModel, gBody, G, 1.0f, alpha);
+                renderer.submit(carModel, gLights, G, lightsOn ? 1.0f : 0.0f, alpha);
+                for (int k = 0; k < 4; ++k)
+                    if (gWheel[k] >= 0) renderer.submit(carModel, gWheel[k], G * matFromQuat(gf.wheelRot[k], gf.wheelPos[k]), 1.0f, alpha);
+            }
+        }
+
         // --- Camcorder OSD and gauges.
         Osd& osd = renderer.osd();
         osd.clear();
@@ -533,13 +632,48 @@ int main(int argc, char** argv) {
             std::snprintf(buf, sizeof buf, "TIME %02d:%02d", int(timeOfDay) % 24, int(timeOfDay * 60) % 60);
             osd.text(286, sliderY + 12, buf, white, 1.0f);
         }
+        // Time attack HUD (top right) and live delta to the best lap (top center).
+        {
+            const uint32_t green = rgba(90, 255, 140), red = rgba(255, 80, 60), dim = rgba(200, 200, 200);
+            float lt = timer.lapTime(simTime);
+            std::string cur = timer.running() ? formatLapTime(lt) : "-:--.---";
+            osd.text(452, 58, cur, timer.running() && !timer.isValid() ? red : white, 2.0f);
+            osd.text(452, 78, "BEST " + (haveBest ? formatLapTime(best.time) : std::string("-:--.---")), dim, 1.0f);
+            osd.text(452, 90, "LAST " + (haveLastLap ? formatLapTime(lastLap) : std::string("-:--.---")) + (haveLastLap && !lastLapValid ? " X" : ""),
+                     dim, 1.0f);
+            if (timer.running()) {
+                float y = 102;
+                for (int k = 0; k < timer.sector() && k < LapTimer::kSectors; ++k) {
+                    float t = timer.split(k), prevT = k > 0 ? timer.split(k - 1) : 0.0f;
+                    std::snprintf(buf, sizeof buf, "S%d %s", k + 1, formatLapTime(t - prevT).c_str());
+                    uint32_t c = dim;
+                    if (haveBest) {
+                        float d = t - best.sectors[k];
+                        std::snprintf(buf + std::strlen(buf), sizeof buf - std::strlen(buf), " %+.2f", d);
+                        c = d <= 0 ? green : red;
+                    }
+                    osd.text(452, y, buf, c, 1.0f);
+                    y += 12;
+                }
+                if (!timer.isValid()) osd.text(452, y, "INVALID", red, 1.0f);
+                if (haveBest && lt <= best.time + 30.0f) {
+                    float d = lt - best.timeAtProgress(lapProgress);
+                    std::snprintf(buf, sizeof buf, "%+.2f", d);
+                    osd.text(320 - float(std::strlen(buf)) * 6.0f, 60, buf, d <= 0 ? green : red, 2.0f);
+                }
+            } else {
+                const char* hint = "TIME ATTACK: CROSS THE START LINE";
+                osd.text(320 - float(std::strlen(hint)) * 3.0f, 60, hint, dim, 1.0f);
+            }
+            if (simTime < bannerUntil) osd.text(320 - float(banner.size()) * 6.0f, 150, banner, bannerColor, 2.0f);
+        }
         if (help && simTime < 25.0) {
             osd.text(28, 60, trackInfo.name, white, 1.0f);
             osd.text(28, 72, carSpec.name, white, 1.0f);
             osd.text(28, 92, "WASD DRIVE  SPACE HANDBRAKE  L HIGH BEAM  H LIGHTS", white, 1.0f);
             osd.text(28, 104, "C CAMERA  T AT/MT  Q/E SHIFT  R RESET TO ROAD  P PIT  F1 HELP", white, 1.0f);
             osd.text(28, 116, "DRAG SLIDER OR HOLD [ ] TO CHANGE TIME  F2 HIDE SLIDER  V TAPE EFFECT", white, 1.0f);
-            std::snprintf(buf, sizeof buf, "F3 RESOLUTION: %s", resNames[resMode]);
+            std::snprintf(buf, sizeof buf, "F3 RESOLUTION: %s   G GHOST %s", resNames[resMode], ghostOn ? "ON" : "OFF");
             osd.text(28, 128, buf, white, 1.0f);
         }
 

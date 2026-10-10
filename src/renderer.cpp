@@ -30,6 +30,7 @@ out vec3 v_nrm;
 out vec3 v_tan;
 out vec2 v_uv;
 out float v_emis;
+out float v_alpha;
 void main() {
     mat4 mvp = mat4(vs_params[0], vs_params[1], vs_params[2], vs_params[3]);
     mat4 model = mat4(vs_params[4], vs_params[5], vs_params[6], vs_params[7]);
@@ -38,6 +39,7 @@ void main() {
     v_tan = mat3(model) * tan0.xyz;
     v_uv = uv0;
     v_emis = vs_params[8].x;
+    v_alpha = vs_params[8].y;
     gl_Position = mvp * vec4(pos, 1.0);
 }
 )";
@@ -54,7 +56,7 @@ void main() {
 //  0: emissive rgb, alpha cutoff (< 0 = opaque, -2 = blended)   1: base color
 //  2: has detail, detail uv scale, has normal map, has maps texture
 //  3: ksDiffuse, ksAmbient, ksSpecular, ksSpecularEXP
-//  4: fresnelC, fresnelEXP, fresnelMaxLevel, -
+//  4: fresnelC, fresnelEXP, fresnelMaxLevel, isAdditive
 // shadow[] layout: 0-3 near cascade matrix, 4-7 far cascade matrix,
 //  8: near texel (world m), far texel (world m), shadow map texel (uv), enabled
 const char* kSceneFS = R"(#version 410
@@ -72,6 +74,7 @@ in vec3 v_nrm;
 in vec3 v_tan;
 in vec2 v_uv;
 in float v_emis;
+in float v_alpha;
 out vec4 frag_color;
 
 float beam(vec3 P, vec3 hp, vec3 dir, float cosOuter, float reach) {
@@ -183,7 +186,12 @@ void main() {
     // Reflections of the sky (paint, glass, chrome): Schlick-style fresnel as in AC.
     if (mat[4].z > 0.0) {
         float f = mat[4].x + (1.0 - mat[4].x) * pow(1.0 - max(dot(N, V), 0.0), mat[4].y);
-        color += skyColor(reflect(-V, N)) * min(f, mat[4].z) * maps.b;
+        // Reflection replaces part of the base color instead of adding on top, so
+        // painted bodies keep their color in bright daylight.
+        float r = clamp(min(f, mat[4].z) * maps.b * 0.6, 0.0, 1.0);
+        vec3 env = skyColor(reflect(-V, N));
+        if (mat[4].w > 1.5) env *= texel.rgb / max(max(texel.r, max(texel.g, texel.b)), 0.05);  // metallic: tinted
+        color = mix(color, env, r);
     }
 
     // Fog takes the sky's horizon color (brighter toward the sun), plus light
@@ -209,7 +217,7 @@ void main() {
     float alpha = 1.0;
     if (cutoff < -1.5) alpha = texel.a;  // blended
     else if (cutoff >= 0.0) alpha = clamp((texel.a - cutoff) / max(fwidth(texel.a), 1e-4) + 0.5, 0.0, 1.0);  // alpha to coverage
-    frag_color = vec4(pow(color, vec3(1.0 / 2.2)), alpha);
+    frag_color = vec4(pow(color, vec3(1.0 / 2.2)), alpha * v_alpha);
 }
 )";
 
@@ -439,6 +447,7 @@ const Glyph kFont[] = {
     {'Y', {0x11, 0x11, 0x11, 0x0A, 0x04, 0x04, 0x04}}, {'Z', {0x1F, 0x01, 0x02, 0x04, 0x08, 0x10, 0x1F}},
     {':', {0x00, 0x0C, 0x0C, 0x00, 0x0C, 0x0C, 0x00}}, {'.', {0x00, 0x00, 0x00, 0x00, 0x00, 0x0C, 0x0C}},
     {'/', {0x00, 0x01, 0x02, 0x04, 0x08, 0x10, 0x00}}, {'-', {0x00, 0x00, 0x00, 0x1F, 0x00, 0x00, 0x00}},
+    {'+', {0x00, 0x04, 0x04, 0x1F, 0x04, 0x04, 0x00}},
     {'[', {0x0E, 0x08, 0x08, 0x08, 0x08, 0x08, 0x0E}}, {']', {0x0E, 0x02, 0x02, 0x02, 0x02, 0x02, 0x0E}},
     {'(', {0x02, 0x04, 0x08, 0x08, 0x08, 0x04, 0x02}}, {')', {0x08, 0x04, 0x02, 0x02, 0x02, 0x04, 0x08}},
     {'*', {0x00, 0x0E, 0x1F, 0x1F, 0x1F, 0x0E, 0x00}},  // record dot
@@ -486,6 +495,8 @@ struct DrawItem {
     const GpuMaterial* mat;
     M4 xf;
     float emissive;
+    float alpha;
+    int pass;  // pipeline: the material's, or blended for see-through draws
     float depth;
 };
 
@@ -914,6 +925,7 @@ int Renderer::addModel(const ModelData& m) {
         gmat.params[4][0] = md.fresnelC;
         gmat.params[4][1] = md.fresnelExp;
         gmat.params[4][2] = md.fresnelMax;
+        gmat.params[4][3] = md.isAdditive;
         gmat.params[0][0] = md.emissive[0];
         gmat.params[0][1] = md.emissive[1];
         gmat.params[0][2] = md.emissive[2];
@@ -927,14 +939,14 @@ int Renderer::addModel(const ModelData& m) {
     return int(g.models.size()) - 1;
 }
 
-void Renderer::submit(int model, int group, const M4& xf, float emissiveScale) {
+void Renderer::submit(int model, int group, const M4& xf, float emissiveScale, float alpha) {
     if (model < 0 || model >= int(gpu->models.size())) return;
     const GpuModel* gm = gpu->models[model].get();
     if (group < 0 || group >= int(gm->groups.size())) return;
     static const GpuMaterial fallback = {{}, {}, {}, {}, {{0, 0, 0, -1}, {1, 1, 1, 1}, {0, 1, 0, 0}, {0.4f, 0.4f, 0, 20}, {0, 5, 0, 0}}, 0};
     for (const Primitive& p : gm->groups[group].prims) {
         const GpuMaterial* mat = (p.material >= 0 && p.material < int(gm->materials.size())) ? &gm->materials[p.material] : &fallback;
-        gpu->queue.push_back({gm, &p, mat, xf, emissiveScale, 0.0f});
+        gpu->queue.push_back({gm, &p, mat, xf, emissiveScale, alpha, alpha < 0.999f ? 2 : mat->pass, 0.0f});
     }
 }
 
@@ -1007,8 +1019,8 @@ void Renderer::render(const RenderView& rv, int fbW, int fbH) {
         d.depth = dot(c, c);
     }
     std::stable_sort(g.queue.begin(), g.queue.end(), [](const DrawItem& a, const DrawItem& b) {
-        if (a.mat->pass != b.mat->pass) return passOrder(a.mat->pass) < passOrder(b.mat->pass);
-        return a.mat->pass == 2 ? a.depth > b.depth : false;
+        if (a.pass != b.pass) return passOrder(a.pass) < passOrder(b.pass);
+        return a.pass == 2 ? a.depth > b.depth : false;
     });
 
     // --- Shadow cascades for the sun (or moon): spheres in front of the camera, fitted
@@ -1039,7 +1051,7 @@ void Renderer::render(const RenderView& rv, int fbW, int fbH) {
             sg_begin_pass(&sp);
             sg_apply_pipeline(g.shadowPip);
             for (const DrawItem& d : g.queue) {
-                if (d.mat->pass == 2) continue;  // glass and other blended surfaces cast no shadow
+                if (d.pass == 2) continue;  // glass, ghosts and other blended draws cast no shadow
                 M4 mvp = lightVP * d.xf;
                 sg_apply_uniforms(0, {mvp.m, 64});
                 float fs[4] = {d.mat->params[0][3], 0, 0, 0};
@@ -1076,8 +1088,8 @@ void Renderer::render(const RenderView& rv, int fbW, int fbH) {
     sg_draw(0, 3, 1);
     int currentPass = -1;
     for (const DrawItem& d : g.queue) {
-        if (d.mat->pass != currentPass) {
-            currentPass = d.mat->pass;
+        if (d.pass != currentPass) {
+            currentPass = d.pass;
             sg_apply_pipeline(g.scenePip[currentPass]);
             sg_apply_uniforms(1, {frame, sizeof(frame)});
             sg_apply_uniforms(3, {shadowU, sizeof(shadowU)});
@@ -1087,6 +1099,7 @@ void Renderer::render(const RenderView& rv, int fbW, int fbH) {
         std::memcpy(vs[0], mvp.m, 64);
         std::memcpy(vs[4], d.xf.m, 64);
         vs[8][0] = d.emissive;
+        vs[8][1] = d.alpha;
         sg_apply_uniforms(0, {vs, sizeof(vs)});
         sg_apply_uniforms(2, {d.mat->params, sizeof(d.mat->params)});
         sg_bindings b = {};

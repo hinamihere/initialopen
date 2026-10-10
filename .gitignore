@@ -5,6 +5,9 @@
 /mods_raw/
 /assets/
 
+# Recorded laps and ghosts (per player)
+/runs/
+
 __pycache__/
 *.pyc
 *.swp

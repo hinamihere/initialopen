@@ -142,7 +142,7 @@ void Physics::addTrack(const std::vector<CollisionData>& meshes, const TrackInfo
             std::fprintf(stderr, "collision mesh %s: %s\n", cm.surface.c_str(), res.GetError().c_str());
             continue;
         }
-        BodyCreationSettings bcs(res.Get(), RVec3::sZero(), Quat::sIdentity(), EMotionType::Static, Layers::STATIC);
+        BodyCreationSettings bcs(res.Get(), RVec3::sZero(), JPH::Quat::sIdentity(), EMotionType::Static, Layers::STATIC);
         auto it = info.friction.find(cm.surface);
         bcs.mFriction = it != info.friction.end() ? it->second : 0.8f;
         bi.CreateAndAddBody(bcs, EActivation::DontActivate);
@@ -158,9 +158,9 @@ void Physics::createCar(const CarSpec& spec, V3 pos, V3 fwd) {
     // Body: the AC collider hull as a box, with the center of mass at the body origin
     // (converted car data is already in center-of-gravity space).
     V3 c = (spec.hullMin + spec.hullMax) * 0.5f, h = (spec.hullMax - spec.hullMin) * 0.5f;
-    RefConst<Shape> hull = RotatedTranslatedShapeSettings(toJ(c), Quat::sIdentity(), new BoxShapeSettings(toJ(h) * 0.95f)).Create().Get();
+    RefConst<Shape> hull = RotatedTranslatedShapeSettings(toJ(c), JPH::Quat::sIdentity(), new BoxShapeSettings(toJ(h) * 0.95f)).Create().Get();
     RefConst<Shape> chassis = OffsetCenterOfMassShapeSettings(-hull->GetCenterOfMass(), hull).Create().Get();
-    BodyCreationSettings bcs(chassis, RVec3(pos.x, pos.y, pos.z), Quat::sRotation(Vec3::sAxisY(), std::atan2(fwd.x, fwd.z)),
+    BodyCreationSettings bcs(chassis, RVec3(pos.x, pos.y, pos.z), JPH::Quat::sRotation(Vec3::sAxisY(), std::atan2(fwd.x, fwd.z)),
                              EMotionType::Dynamic, Layers::MOVING);
     MassProperties mp;
     mp.SetMassAndInertiaOfSolidBox(toJ(spec.inertiaBox), 1000.0f);
@@ -303,7 +303,7 @@ float Physics::groundBelow(V3 from, float maxDist) const {
 
 void Physics::resetCar(V3 pos, V3 fwd) {
     BodyInterface& bi = impl->system.GetBodyInterface();
-    bi.SetPositionAndRotation(impl->car->GetID(), RVec3(pos.x, pos.y, pos.z), Quat::sRotation(Vec3::sAxisY(), std::atan2(fwd.x, fwd.z)),
+    bi.SetPositionAndRotation(impl->car->GetID(), RVec3(pos.x, pos.y, pos.z), JPH::Quat::sRotation(Vec3::sAxisY(), std::atan2(fwd.x, fwd.z)),
                               EActivation::Activate);
     bi.SetLinearAndAngularVelocity(impl->car->GetID(), Vec3::sZero(), Vec3::sZero());
     impl->controller->GetEngine().SetCurrentRPM(1500.0f);

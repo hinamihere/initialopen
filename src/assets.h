@@ -22,6 +22,7 @@ struct MaterialData {
     // Assetto Corsa shading values.
     float ksDiffuse = 0.4f, ksAmbient = 0.4f, ksSpecular = 0.0f, ksSpecularExp = 20.0f;
     float fresnelC = 0.0f, fresnelExp = 5.0f, fresnelMax = 0.0f;
+    float isAdditive = 0.0f;  // 2 = reflections tinted by the base color (metallic paint)
     float baseColor[4] = {1, 1, 1, 1};
     float emissive[3] = {0, 0, 0};
     float cutoff = 0.5f;

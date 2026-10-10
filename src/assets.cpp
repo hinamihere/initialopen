@@ -252,6 +252,7 @@ bool loadGlb(const std::string& path, ModelData& out, std::vector<CollisionData>
                 md.fresnelC = ex.value("fresnelC", 0.0f);
                 md.fresnelExp = ex.value("fresnelEXP", 5.0f);
                 md.fresnelMax = ex.value("fresnelMaxLevel", 0.0f);
+                md.isAdditive = ex.value("isAdditive", 0.0f);
             }
         }
         md.alpha = m.alpha_mode == cgltf_alpha_mode_blend  ? MaterialData::Blend

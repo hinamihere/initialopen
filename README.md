@@ -62,6 +62,13 @@ without it the game uses a placeholder synth. To hear the car's real sounds:
 
 The console then prints which bank events were found and their parameters.
 
+## Time attack
+
+Cross the start line to start a lap. Sector splits and a live delta compare you
+with your best lap, whose ghost drives alongside you. Laps that skip part of the
+track or use a reset don't count. Best laps are saved per track and car in
+`runs/<track>/<layout>/<car>.best`.
+
 ## Run
 
 ```bash
@@ -85,4 +92,5 @@ The game picks the first track and car found under `assets/`. Useful flags:
 | drag slider, hold `[` `]` | | time of day |
 | V | | tape effect on/off |
 | F3 | | resolution: native / half / 480p |
+| G | | best-lap ghost on/off |
 | F1 / F2 | | help / time slider |

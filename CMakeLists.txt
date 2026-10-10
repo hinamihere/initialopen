@@ -62,7 +62,8 @@ add_executable(initialopen
   src/assets.cpp
   src/physics.cpp
   src/renderer.cpp
-  src/audio.cpp)
+  src/audio.cpp
+  src/timing.cpp)
 target_include_directories(initialopen PRIVATE src ${sokol_SOURCE_DIR} ${cgltf_SOURCE_DIR} ${stb_SOURCE_DIR})
 target_compile_definitions(initialopen PRIVATE SOKOL_GLCORE)
 target_link_libraries(initialopen PRIVATE SDL3::SDL3-static Jolt nlohmann_json::nlohmann_json)

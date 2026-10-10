@@ -79,6 +79,63 @@ inline M4 lookAt(V3 eye, V3 target, V3 up) {
     return r;
 }
 
+struct Quat {
+    float x = 0, y = 0, z = 0, w = 1;
+};
+
+// Rotation part of a rigid transform as a quaternion.
+inline Quat quatFromMat(const M4& m) {
+    float r00 = m.m[0], r11 = m.m[5], r22 = m.m[10];
+    float r10 = m.m[1], r20 = m.m[2], r01 = m.m[4], r21 = m.m[6], r02 = m.m[8], r12 = m.m[9];
+    Quat q;
+    float tr = r00 + r11 + r22;
+    if (tr > 0) {
+        float s = 0.5f / std::sqrt(tr + 1.0f);
+        q = {(r21 - r12) * s, (r02 - r20) * s, (r10 - r01) * s, 0.25f / s};
+    } else if (r00 > r11 && r00 > r22) {
+        float s = 2.0f * std::sqrt(1.0f + r00 - r11 - r22);
+        q = {0.25f * s, (r01 + r10) / s, (r02 + r20) / s, (r21 - r12) / s};
+    } else if (r11 > r22) {
+        float s = 2.0f * std::sqrt(1.0f + r11 - r00 - r22);
+        q = {(r01 + r10) / s, 0.25f * s, (r12 + r21) / s, (r02 - r20) / s};
+    } else {
+        float s = 2.0f * std::sqrt(1.0f + r22 - r00 - r11);
+        q = {(r02 + r20) / s, (r12 + r21) / s, 0.25f * s, (r10 - r01) / s};
+    }
+    return q;
+}
+
+inline M4 matFromQuat(Quat q, V3 p) {
+    M4 m = M4::identity();
+    float xx = q.x * q.x, yy = q.y * q.y, zz = q.z * q.z, xy = q.x * q.y, xz = q.x * q.z, yz = q.y * q.z;
+    float wx = q.w * q.x, wy = q.w * q.y, wz = q.w * q.z;
+    m.m[0] = 1 - 2 * (yy + zz); m.m[4] = 2 * (xy - wz);     m.m[8] = 2 * (xz + wy);
+    m.m[1] = 2 * (xy + wz);     m.m[5] = 1 - 2 * (xx + zz); m.m[9] = 2 * (yz - wx);
+    m.m[2] = 2 * (xz - wy);     m.m[6] = 2 * (yz + wx);     m.m[10] = 1 - 2 * (xx + yy);
+    m.m[12] = p.x; m.m[13] = p.y; m.m[14] = p.z;
+    return m;
+}
+
+// Normalized lerp along the shorter arc.
+inline Quat nlerp(Quat a, Quat b, float t) {
+    if (a.x * b.x + a.y * b.y + a.z * b.z + a.w * b.w < 0) b = {-b.x, -b.y, -b.z, -b.w};
+    Quat q{a.x + (b.x - a.x) * t, a.y + (b.y - a.y) * t, a.z + (b.z - a.z) * t, a.w + (b.w - a.w) * t};
+    float l = std::sqrt(q.x * q.x + q.y * q.y + q.z * q.z + q.w * q.w);
+    return {q.x / l, q.y / l, q.z / l, q.w / l};
+}
+
+// Inverse of a rotation + translation matrix.
+inline M4 rigidInverse(const M4& m) {
+    M4 r = M4::identity();
+    for (int c = 0; c < 3; ++c)
+        for (int rr = 0; rr < 3; ++rr) r.m[c * 4 + rr] = m.m[rr * 4 + c];
+    V3 t{m.m[12], m.m[13], m.m[14]};
+    r.m[12] = -(r.m[0] * t.x + r.m[4] * t.y + r.m[8] * t.z);
+    r.m[13] = -(r.m[1] * t.x + r.m[5] * t.y + r.m[9] * t.z);
+    r.m[14] = -(r.m[2] * t.x + r.m[6] * t.y + r.m[10] * t.z);
+    return r;
+}
+
 inline M4 ortho(float l, float r, float b, float t, float n, float f) {
     M4 m = M4::identity();
     m.m[0] = 2.0f / (r - l);
